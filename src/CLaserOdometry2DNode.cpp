@@ -95,10 +95,12 @@ void CLaserOdometry2DNode::LaserCallBack(const sensor_msgs::msg::LaserScan::Shar
       // inform of new scan available
       new_scan_available = true;
     }
-    else
+    else if (setLaserPoseFromTf())
     {
-      // Initialize module on first scan (from laser params)
-      setLaserPoseFromTf();
+      // Initialize module on first scan (from laser params). Only once the
+      // laser->base_frame_id transform actually resolves -- otherwise wait
+      // and retry on the next scan rather than initializing from a bogus
+      // identity transform.
       rf2o_ref.init(last_scan, initial_robot_pose.pose.pose);
       rf2o_ref.first_laser_scan = false;
     }
@@ -106,24 +108,32 @@ void CLaserOdometry2DNode::LaserCallBack(const sensor_msgs::msg::LaserScan::Shar
 }
 
 
-/** 
+/**
    * Gets the laser pose with respect the base_link (through TF)
    * This allow estimation of the odometry with respect to the robot base reference system.
+   * Called every scan (not just once at startup) so a non-rigid sensor
+   * mount (e.g. a lidar on a moving head joint) is tracked correctly.
+   * Returns false, leaving the last known-good transform in place, if the
+   * lookup fails.
    */
 bool CLaserOdometry2DNode::setLaserPoseFromTf()
-{  
-  bool retrieved = false;  
+{
   geometry_msgs::msg::TransformStamped tf_laser;
 
   try
   {
     tf_laser = buffer_->lookupTransform(base_frame_id, last_scan.header.frame_id, tf2::TimePointZero);
-    retrieved = true;
   }
   catch (tf2::TransformException &ex)
   {
-    RCLCPP_ERROR(get_logger(), "%s",ex.what());
-    retrieved = false;
+    // Don't let a transient lookup failure overwrite the last known-good
+    // extrinsic with a garbage/identity transform -- keep using it until
+    // the next successful lookup. This matters once the laser->base_frame_id
+    // transform is re-queried every scan (not just once at startup): a
+    // momentary TF gap should degrade to "stale but valid", not corrupt.
+    RCLCPP_WARN(get_logger(), "Could not look up %s -> %s, keeping last known transform: %s",
+                base_frame_id.c_str(), last_scan.header.frame_id.c_str(), ex.what());
+    return false;
   }
 
   // Keep this transform as Eigen Matrix3d
@@ -143,10 +153,10 @@ bool CLaserOdometry2DNode::setLaserPoseFromTf()
   laser_tf.translation()(1) = t[1];
   laser_tf.translation()(2) = t[2];
 
-  // Sets this transform in rf2o 
+  // Sets this transform in rf2o
   rf2o_ref.setLaserPose(laser_tf);
 
-  return retrieved;
+  return true;
 }
 
 
@@ -164,6 +174,14 @@ void CLaserOdometry2DNode::process()
   // Do only run when a new scan is ready 
   if( rf2o_ref.is_initialized() && scan_available() )
   {
+    // Refresh the laser->base_frame_id extrinsic every scan, not just once
+    // at startup -- the sensor mount isn't assumed rigid (e.g. a
+    // head-mounted lidar that pans independently of the base). Safe to do
+    // per-scan: laser_pose_ (the scan-matched absolute laser pose) is
+    // computed independently of this extrinsic; only the final
+    // laser_pose_ -> robot_pose_ conversion uses it.
+    setLaserPoseFromTf();
+
     // Process odometry estimation
     rf2o_ref.odometryCalculation(last_scan);
 
