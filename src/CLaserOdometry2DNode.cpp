@@ -40,6 +40,20 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(): Node("CLaserOdometry2DNode")
   this->declare_parameter<double>("freq", 10.0);
   this->get_parameter("freq", freq);
 
+  // Measurement uncertainty reported on the published Odometry (see
+  // publish()). Defaults assume scan matching is noisier than wheel
+  // encoders: 0.02m position and 0.05rad yaw standard deviation, squared
+  // here into variances. Tune per robot/sensor via parameters rather than
+  // editing these.
+  this->declare_parameter<double>("position_covariance", 0.02 * 0.02);
+  this->get_parameter("position_covariance", position_covariance);
+  this->declare_parameter<double>("yaw_covariance", 0.05 * 0.05);
+  this->get_parameter("yaw_covariance", yaw_covariance);
+  this->declare_parameter<double>("linear_velocity_covariance", 0.05 * 0.05);
+  this->get_parameter("linear_velocity_covariance", linear_velocity_covariance);
+  this->declare_parameter<double>("angular_velocity_covariance", 0.1 * 0.1);
+  this->get_parameter("angular_velocity_covariance", angular_velocity_covariance);
+
   // Init Publishers and Subscribers
   //---------------------------------
   buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
@@ -241,6 +255,36 @@ void CLaserOdometry2DNode::publish()
   odom.twist.twist.linear.x = rf2o_ref.lin_speed;    //linear speed
   odom.twist.twist.linear.y = 0.0;
   odom.twist.twist.angular.z = rf2o_ref.ang_speed;   //angular speed
+
+  // Report real measurement uncertainty. Both covariance matrices are 6x6
+  // row-major over (x, y, z, roll, pitch, yaw), so the variance for each
+  // axis sits on the diagonal at index 7*i.
+  //
+  // Leaving these all-zero (the default-constructed state, and what this
+  // node did previously) is not neutral: a variance of exactly zero reads
+  // as "infinitely certain" to a Kalman filter, so a consumer such as
+  // robot_localization's ekf_node has no basis on which to weigh this
+  // estimate against any other source.
+  //
+  // This is a planar scan matcher, so only x/y/yaw are actually observed.
+  // The unobserved z/roll/pitch axes get a large variance rather than zero
+  // so that a consumer configured to fuse them treats them as
+  // uninformative instead of perfectly known.
+  const double UNOBSERVED = 1e6;
+  odom.pose.covariance[0]  = position_covariance;   // x
+  odom.pose.covariance[7]  = position_covariance;   // y
+  odom.pose.covariance[14] = UNOBSERVED;            // z
+  odom.pose.covariance[21] = UNOBSERVED;            // roll
+  odom.pose.covariance[28] = UNOBSERVED;            // pitch
+  odom.pose.covariance[35] = yaw_covariance;        // yaw
+
+  odom.twist.covariance[0]  = linear_velocity_covariance;   // vx
+  odom.twist.covariance[7]  = linear_velocity_covariance;   // vy
+  odom.twist.covariance[14] = UNOBSERVED;                   // vz
+  odom.twist.covariance[21] = UNOBSERVED;                   // vroll
+  odom.twist.covariance[28] = UNOBSERVED;                   // vpitch
+  odom.twist.covariance[35] = angular_velocity_covariance;  // vyaw
+
   //publish the message
   odom_pub->publish(odom);
 

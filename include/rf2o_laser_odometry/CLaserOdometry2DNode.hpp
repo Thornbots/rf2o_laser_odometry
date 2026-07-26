@@ -24,6 +24,13 @@ public:
   CLaserOdometry2D    rf2o_ref;
   bool                publish_tf, new_scan_available;
   double              freq;
+  // Reported measurement uncertainty (variances, not standard deviations)
+  // for the published Odometry. Left at zero these read as "infinitely
+  // certain" to any downstream Kalman filter -- see publish().
+  double              position_covariance;
+  double              yaw_covariance;
+  double              linear_velocity_covariance;
+  double              angular_velocity_covariance;
   std::string         laser_scan_topic;
   std::string         odom_topic;
   std::string         base_frame_id;
