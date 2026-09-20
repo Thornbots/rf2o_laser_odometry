@@ -53,3 +53,10 @@ against wheel odometry, and every EKF/AMCL/SLAM parameter, belong to
   be roughly comparable to wheel encoders, never validated against the drift
   suite in `../sim/test/localization/`. Either measure them or expose them from
   `sentry_localization`'s launch so they can be tuned without a rebuild.
+
+## Committing
+
+This package is a submodule of `thornbots_workspace`, on branch `ros2`. Commit
+and push here first, then bump this gitlink in `../` — one logical change, one
+bump, never a gitlink pointing at an unpushed commit. Full rule in
+`../CLAUDE.md` § Packages.
