@@ -765,8 +765,6 @@ void CLaserOdometry2D::performWarping()
   for (unsigned int i=1; i<=level; i++)
     acu_trans = transformations[i-1]*acu_trans;
 
-  Eigen::Matrix3f acu_trans_inv = acu_trans.inverse();
-
   Eigen::MatrixXf wacu = Eigen::MatrixXf::Constant(1, cols_i, 0.f);
 
   range_warped[image_level].setConstant(1, cols_i, 0.f);
@@ -779,8 +777,8 @@ void CLaserOdometry2D::performWarping()
     if (range[image_level](j) > 0.f)
     {
       //Transform point to the warped reference frame
-      const float x_w = acu_trans_inv(0,0)*xx[image_level](j) + acu_trans_inv(0,1)*yy[image_level](j) + acu_trans_inv(0,2);
-      const float y_w = acu_trans_inv(1,0)*xx[image_level](j) + acu_trans_inv(1,1)*yy[image_level](j) + acu_trans_inv(1,2);
+      const float x_w = acu_trans(0,0)*xx[image_level](j) + acu_trans(0,1)*yy[image_level](j) + acu_trans(0,2);
+      const float y_w = acu_trans(1,0)*xx[image_level](j) + acu_trans(1,1)*yy[image_level](j) + acu_trans(1,2);
       const float tita_w = std::atan2(y_w, x_w);
       const float range_w = std::sqrt(x_w*x_w + y_w*y_w);
 
