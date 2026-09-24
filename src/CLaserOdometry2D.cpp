@@ -86,6 +86,7 @@ void CLaserOdometry2D::init(const sensor_msgs::msg::LaserScan& scan,
 
   // Get the initial laser pose assuming laser is fixed with respect the base_link
   laser_pose_    = robot_initial_pose * laser_pose_on_robot_;
+  robot_initial_pose_ = robot_initial_pose;
   laser_oldpose_ = laser_oldpose_;
 
 
@@ -956,6 +957,17 @@ void CLaserOdometry2D::PoseUpdate()
   pose_aux_2D.translation()(1) = acu_trans(1,2);
 
   laser_pose_ = laser_pose_ * pose_aux_2D;
+
+  // The matched yaw increment still steers this step's translation, but a
+  // chassis that cannot turn keeps its heading, so accumulated yaw error
+  // never rotates later translation. The laser pose is rebuilt through the
+  // live extrinsic, which also tracks a lidar on a panning head.
+  if (fixed_heading)
+  {
+    Pose3d robot_pose = laser_pose_ * laser_pose_on_robot_inv_;
+    robot_pose.linear() = robot_initial_pose_.linear();
+    laser_pose_ = robot_pose * laser_pose_on_robot_;
+  }
 
   last_increment_ = pose_aux_2D;
 
