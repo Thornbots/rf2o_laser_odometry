@@ -44,6 +44,18 @@ result:
   scans in five. Now every scan is matched in its callback (queue depth 10, a
   warning on any skipped scan), the `freq` param is gone, and the extrinsic is
   looked up at the scan's stamp, falling back to the latest transform.
+- **`fixed_heading` parameter** (default `false`). When true,
+  the robot's yaw is pinned to its initial pose after each match; the laser
+  pose is rebuilt through the live extrinsic, so a panning head is still
+  tracked. `sentry_localization` sets it true.
+- **`odom_prior_topic` parameter** (default empty, off). When set, each
+  match's velocity prior is that Odometry topic's motion between the two
+  scan stamps, in place of upstream's constant-velocity guess, which reads
+  "stopped" at the start of every move and pulls the match short.
+  `sentry_localization` sets `/odom`. Scans and odom are handled in arrival
+  order, so a scan that lands before the odom covering its stamp uses the
+  newest odom pose, up to 0.05 s old; past that it falls back to the
+  constant-velocity prior.
 - **Dropped the `cmake_modules` dependency** (`c076912`), which isn't packaged
   for Humble.
 

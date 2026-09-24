@@ -151,6 +151,11 @@ public:
   Pose3d laser_oldpose_;
   Pose3d robot_pose_;
   Pose3d robot_oldpose_;
+  Pose3d robot_initial_pose_;
+
+  // Pin the robot's heading to its initial pose after every match, for a
+  // chassis that never rotates; see the fixed_heading node parameter.
+  bool fixed_heading = false;
 
   bool test;
   std::vector<double> last_m_lin_speeds;

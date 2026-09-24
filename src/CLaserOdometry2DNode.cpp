@@ -37,6 +37,16 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(): Node("CLaserOdometry2DNode")
   this->get_parameter("publish_tf", publish_tf);
   this->declare_parameter<std::string>("init_pose_from_topic", "/base_pose_ground_truth");
   this->get_parameter("init_pose_from_topic", init_pose_from_topic);
+  // true: the robot's yaw stays at its initial value (holonomic chassis
+  // with a fixed heading); rf2o still solves for rotation, only the
+  // accumulated heading is pinned.
+  this->declare_parameter<bool>("fixed_heading", false);
+  this->get_parameter("fixed_heading", rf2o_ref.fixed_heading);
+  // Non-empty: seed each match with this Odometry topic's motion between
+  // the two scans, in place of rf2o's constant-velocity guess, which reads
+  // "stopped" at the start of every move and pulls the match short.
+  this->declare_parameter<std::string>("odom_prior_topic", "");
+  this->get_parameter("odom_prior_topic", odom_prior_topic);
 
   // Measurement uncertainty reported on the published Odometry (see
   // publish()). Defaults assume scan matching is noisier than wheel
@@ -63,6 +73,12 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(): Node("CLaserOdometry2DNode")
   laser_sub = this->create_subscription<sensor_msgs::msg::LaserScan>(laser_scan_topic,rclcpp::QoS(rclcpp::KeepLast(10)).best_effort().durability_volatile(),
       std::bind(&CLaserOdometry2DNode::LaserCallBack, this, std::placeholders::_1));
   
+  if (!odom_prior_topic.empty())
+  {
+    odom_prior_sub = this->create_subscription<nav_msgs::msg::Odometry>(odom_prior_topic, 50,
+        std::bind(&CLaserOdometry2DNode::odomPriorCallBack, this, std::placeholders::_1));
+  }
+
   // Initialize pose
   if (init_pose_from_topic != "")
   {
@@ -223,12 +239,101 @@ void CLaserOdometry2DNode::process()
     // laser_pose_ -> robot_pose_ conversion uses it.
     setLaserPoseFromTf();
 
+    // Replace the constant-velocity guess with measured motion, if any.
+    if (!odom_prior_topic.empty())
+      setOdomPrior();
+
     // Process odometry estimation
     rf2o_ref.odometryCalculation(last_scan);
 
     // Publish odometry over ROS2 (tf/topic)
     publish();
   }
+}
+
+
+void CLaserOdometry2DNode::odomPriorCallBack(const nav_msgs::msg::Odometry::SharedPtr msg)
+{
+  OdomSample s;
+  s.t = rclcpp::Time(msg->header.stamp).seconds();
+  s.x = msg->pose.pose.position.x;
+  s.y = msg->pose.pose.position.y;
+  s.yaw = tf2::getYaw(msg->pose.pose.orientation);
+  if (!odom_prior_buf.empty())
+  {
+    if (s.t == odom_prior_buf.back().t)
+      return;  // duplicate stamp
+    if (s.t < odom_prior_buf.back().t)
+      odom_prior_buf.clear();  // time went backwards (sim reset): start over
+  }
+  odom_prior_buf.push_back(s);
+  while (odom_prior_buf.size() > 2 && odom_prior_buf.back().t - odom_prior_buf.front().t > 2.0)
+    odom_prior_buf.pop_front();
+}
+
+
+/**
+ * Odom pose at time t, linearly interpolated; false if t is outside the
+ * buffer by more than 50 ms.
+ */
+bool CLaserOdometry2DNode::odomPriorAt(double t, OdomSample &out) const
+{
+  if (odom_prior_buf.empty() || t < odom_prior_buf.front().t - 0.05 ||
+      t > odom_prior_buf.back().t + 0.05)
+    return false;
+  if (t <= odom_prior_buf.front().t) { out = odom_prior_buf.front(); return true; }
+  if (t >= odom_prior_buf.back().t) { out = odom_prior_buf.back(); return true; }
+  for (size_t i = 1; i < odom_prior_buf.size(); i++)
+  {
+    const OdomSample &a = odom_prior_buf[i - 1], &b = odom_prior_buf[i];
+    if (t <= b.t)
+    {
+      const double k = (b.t > a.t) ? (t - a.t) / (b.t - a.t) : 0.0;
+      out.t = t;
+      out.x = a.x + k * (b.x - a.x);
+      out.y = a.y + k * (b.y - a.y);
+      out.yaw = a.yaw + k * std::remainder(b.yaw - a.yaw, 2.0 * M_PI);
+      return true;
+    }
+  }
+  return false;
+}
+
+
+/**
+ * Set rf2o's velocity prior to the odom motion between the last matched
+ * scan and this one, as a per-scan increment in the previous laser frame.
+ * Leaves the constant-velocity prior in place if odom doesn't cover both.
+ */
+bool CLaserOdometry2DNode::setOdomPrior()
+{
+  OdomSample p0, p1;
+  if (!odomPriorAt(rf2o_ref.last_odom_time.seconds(), p0) ||
+      !odomPriorAt(rf2o_ref.current_scan_time.seconds(), p1))
+  {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+      "No %s pose at both scan stamps (%.3f, %.3f; buffer %zu, %.3f..%.3f); "
+      "using the constant-velocity prior", odom_prior_topic.c_str(),
+      rf2o_ref.last_odom_time.seconds(), rf2o_ref.current_scan_time.seconds(),
+      odom_prior_buf.size(), odom_prior_buf.empty() ? 0.0 : odom_prior_buf.front().t,
+      odom_prior_buf.empty() ? 0.0 : odom_prior_buf.back().t);
+    return false;
+  }
+  RCLCPP_INFO_ONCE(get_logger(), "Seeding scan matches from %s", odom_prior_topic.c_str());
+
+  // Robot increment in the previous robot frame, then into the laser frame.
+  const double c = std::cos(p0.yaw), s = std::sin(p0.yaw);
+  const double dx = p1.x - p0.x, dy = p1.y - p0.y;
+  Pose3d robot_inc = Pose3d::Identity();
+  robot_inc.linear() = rf2o::matrixYaw(std::remainder(p1.yaw - p0.yaw, 2.0 * M_PI));
+  robot_inc.translation() << c * dx + s * dy, -s * dx + c * dy, 0.0;
+  const Pose3d laser_inc =
+    rf2o_ref.laser_pose_on_robot_inv_ * robot_inc * rf2o_ref.laser_pose_on_robot_;
+
+  rf2o_ref.kai_loc_old_(0) = laser_inc.translation()(0);
+  rf2o_ref.kai_loc_old_(1) = laser_inc.translation()(1);
+  rf2o_ref.kai_loc_old_(2) = rf2o::getYaw(laser_inc.rotation());
+  return true;
 }
 
 
