@@ -41,6 +41,13 @@ result:
   the robot's yaw is pinned to its initial pose after each match; the laser
   pose is rebuilt through the live extrinsic, so a panning head is still
   tracked. `sentry_localization` sets it true.
+- **`odom_prior_topic` parameter** (default empty, off). When set, each
+  match's velocity prior is that Odometry topic's motion between the two
+  scan stamps, in place of upstream's constant-velocity guess, which reads
+  "stopped" at the start of every move and pulls the match short.
+  `sentry_localization` sets `/odom`. The main loop drains callbacks with
+  `spin_all`; `spin_some` took one message per subscription per 20 Hz tick,
+  so a 100 Hz prior topic backed up.
 - **Dropped the `cmake_modules` dependency** (`c076912`), which isn't packaged
   for Humble.
 
