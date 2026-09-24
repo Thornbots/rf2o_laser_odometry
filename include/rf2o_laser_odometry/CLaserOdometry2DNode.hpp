@@ -9,6 +9,8 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2/utils.h>
 
+#include <deque>
+
 namespace rf2o {
 
 class CLaserOdometry2DNode : public rclcpp::Node
@@ -36,6 +38,7 @@ public:
   std::string         base_frame_id;
   std::string         odom_frame_id;
   std::string         init_pose_from_topic;
+  std::string         odom_prior_topic;
 
   sensor_msgs::msg::LaserScan                     last_scan;
   bool                                            GT_pose_initialized;
@@ -47,10 +50,18 @@ public:
   // Subscriptions & Publishers
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr  laser_sub;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr      initPose_sub;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr      odom_prior_sub;
+
+  // Recent odom_prior_topic poses (stamp s, x, y, yaw), oldest first.
+  struct OdomSample { double t, x, y, yaw; };
+  std::deque<OdomSample>                                        odom_prior_buf;
+  bool odomPriorAt(double t, OdomSample &out) const;
+  bool setOdomPrior();
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr         odom_pub;
 
   // CallBacks
   void LaserCallBack(const sensor_msgs::msg::LaserScan::SharedPtr new_scan);
   void initPoseCallBack(const nav_msgs::msg::Odometry::SharedPtr new_initPose);
+  void odomPriorCallBack(const nav_msgs::msg::Odometry::SharedPtr msg);
 };
 
