@@ -37,6 +37,10 @@ result:
   (default `0.02**2`), `yaw_covariance` (`0.05**2`),
   `linear_velocity_covariance` (`0.05**2`), `angular_velocity_covariance`
   (`0.1**2`) — with the unobserved z/roll/pitch axes set to `1e6`.
+- **`fixed_heading` parameter** (default `false`). When true,
+  the robot's yaw is pinned to its initial pose after each match; the laser
+  pose is rebuilt through the live extrinsic, so a panning head is still
+  tracked. `sentry_localization` sets it true.
 - **Dropped the `cmake_modules` dependency** (`c076912`), which isn't packaged
   for Humble.
 

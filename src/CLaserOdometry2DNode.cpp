@@ -39,6 +39,11 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(): Node("CLaserOdometry2DNode")
   this->get_parameter("init_pose_from_topic", init_pose_from_topic);
   this->declare_parameter<double>("freq", 10.0);
   this->get_parameter("freq", freq);
+  // true: the robot's yaw stays at its initial value (holonomic chassis
+  // with a fixed heading); rf2o still solves for rotation, only the
+  // accumulated heading is pinned.
+  this->declare_parameter<bool>("fixed_heading", false);
+  this->get_parameter("fixed_heading", rf2o_ref.fixed_heading);
 
   // Measurement uncertainty reported on the published Odometry (see
   // publish()). Defaults assume scan matching is noisier than wheel
