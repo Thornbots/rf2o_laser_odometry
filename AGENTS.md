@@ -12,7 +12,9 @@ algorithm; the paper it cites is the reference for anything in
 Launched only by `../sentry_localization`'s `localization.launch.py`, and only
 when `use_ekf:=true`. It reads `/scan`, publishes `/scan_odom`, and
 `publish_tf` is **false** — `robot_localization`'s EKF owns `odom->root`, not
-this node. `base_frame_id` is `root`, `freq` is 20 Hz.
+this node. `base_frame_id` is `root`. It matches every scan in the scan
+callback with no loop rate, so it keeps up with a sim faster than real time as
+long as matching itself does.
 
 Why each of those values is what it is, and the measurement history behind them,
 lives in `../sentry_localization/README.md` (`## Notes`). Read that before
@@ -37,6 +39,11 @@ result:
   (default `0.02**2`), `yaw_covariance` (`0.05**2`),
   `linear_velocity_covariance` (`0.05**2`), `angular_velocity_covariance`
   (`0.1**2`) — with the unobserved z/roll/pitch axes set to `1e6`.
+- **Scan-driven, sim-time-safe processing.** Upstream matched on a 20 Hz
+  wall-clock `rclcpp::Rate` with a depth-1 queue, so a sim at 10x skipped four
+  scans in five. Now every scan is matched in its callback (queue depth 10, a
+  warning on any skipped scan), the `freq` param is gone, and the extrinsic is
+  looked up at the scan's stamp, falling back to the latest transform.
 - **`fixed_heading` parameter** (default `false`). When true,
   the robot's yaw is pinned to its initial pose after each match; the laser
   pose is rebuilt through the live extrinsic, so a panning head is still
@@ -45,9 +52,10 @@ result:
   match's velocity prior is that Odometry topic's motion between the two
   scan stamps, in place of upstream's constant-velocity guess, which reads
   "stopped" at the start of every move and pulls the match short.
-  `sentry_localization` sets `/odom`. The main loop drains callbacks with
-  `spin_all`; `spin_some` took one message per subscription per 20 Hz tick,
-  so a 100 Hz prior topic backed up.
+  `sentry_localization` sets `/odom`. Scans and odom are handled in arrival
+  order, so a scan that lands before the odom covering its stamp uses the
+  newest odom pose, up to 0.05 s old; past that it falls back to the
+  constant-velocity prior.
 - **Dropped the `cmake_modules` dependency** (`c076912`), which isn't packaged
   for Humble.
 
