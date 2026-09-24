@@ -37,8 +37,6 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(): Node("CLaserOdometry2DNode")
   this->get_parameter("publish_tf", publish_tf);
   this->declare_parameter<std::string>("init_pose_from_topic", "/base_pose_ground_truth");
   this->get_parameter("init_pose_from_topic", init_pose_from_topic);
-  this->declare_parameter<double>("freq", 10.0);
-  this->get_parameter("freq", freq);
 
   // Measurement uncertainty reported on the published Odometry (see
   // publish()). Defaults assume scan matching is noisier than wheel
@@ -60,7 +58,9 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(): Node("CLaserOdometry2DNode")
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*buffer_);
   odom_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(this);
   odom_pub  = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic, 5);
-  laser_sub = this->create_subscription<sensor_msgs::msg::LaserScan>(laser_scan_topic,rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile(),
+  // Every scan is matched against the one before it, so queue a burst
+  // (a sim running faster than real time) instead of dropping to the newest.
+  laser_sub = this->create_subscription<sensor_msgs::msg::LaserScan>(laser_scan_topic,rclcpp::QoS(rclcpp::KeepLast(10)).best_effort().durability_volatile(),
       std::bind(&CLaserOdometry2DNode::LaserCallBack, this, std::placeholders::_1));
   
   // Initialize pose
@@ -90,24 +90,21 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(): Node("CLaserOdometry2DNode")
 
 
 /**
- * Keeps the last scan from the 2D lidar to be latter processed
- * On the first laser scan, the node is initialized.
+ * Matches every scan against the previous one as it arrives, so the node
+ * keeps pace with the scan stream in any clock (a sim at 10x real time
+ * included). The first scan initializes the module instead.
 */
 void CLaserOdometry2DNode::LaserCallBack(const sensor_msgs::msg::LaserScan::SharedPtr new_scan)
 {
   if (GT_pose_initialized)
   {
-    // Keep in memory the last received laser_scan
     last_scan = *new_scan;
     rf2o_ref.current_scan_time = last_scan.header.stamp;
-    
+
     if (rf2o_ref.first_laser_scan == false)
     {
-      // copy laser range data to rf2o internal variable
-      for (unsigned int i = 0; i < rf2o_ref.width; i++)
-        rf2o_ref.range_wf(i) = new_scan->ranges[i];
-      // inform of new scan available
-      new_scan_available = true;
+      warnOnSkippedScan();
+      process();
     }
     else if (setLaserPoseFromTf())
     {
@@ -127,8 +124,9 @@ void CLaserOdometry2DNode::LaserCallBack(const sensor_msgs::msg::LaserScan::Shar
    * This allow estimation of the odometry with respect to the robot base reference system.
    * Called every scan (not just once at startup) so a non-rigid sensor
    * mount (e.g. a lidar on a moving head joint) is tracked correctly.
-   * Returns false, leaving the last known-good transform in place, if the
-   * lookup fails.
+   * Looked up at the scan's stamp, falling back to the latest transform
+   * when TF hasn't reached that stamp yet. Returns false, leaving the last
+   * known-good transform in place, if both lookups fail.
    */
 bool CLaserOdometry2DNode::setLaserPoseFromTf()
 {
@@ -136,7 +134,21 @@ bool CLaserOdometry2DNode::setLaserPoseFromTf()
 
   try
   {
-    tf_laser = buffer_->lookupTransform(base_frame_id, last_scan.header.frame_id, tf2::TimePointZero);
+    tf_laser = buffer_->lookupTransform(base_frame_id, last_scan.header.frame_id,
+                                        tf2_ros::fromMsg(last_scan.header.stamp));
+  }
+  catch (tf2::ExtrapolationException &)
+  {
+    try
+    {
+      tf_laser = buffer_->lookupTransform(base_frame_id, last_scan.header.frame_id, tf2::TimePointZero);
+    }
+    catch (tf2::TransformException &ex)
+    {
+      RCLCPP_WARN(get_logger(), "Could not look up %s -> %s, keeping last known transform: %s",
+                  base_frame_id.c_str(), last_scan.header.frame_id.c_str(), ex.what());
+      return false;
+    }
   }
   catch (tf2::TransformException &ex)
   {
@@ -174,19 +186,34 @@ bool CLaserOdometry2DNode::setLaserPoseFromTf()
 }
 
 
-bool CLaserOdometry2DNode::scan_available()
+/**
+ * Warns when the gap to the previous scan's stamp exceeds 1.5 scan periods,
+ * i.e. a scan was lost upstream or dropped from the full subscription queue.
+ * The period is the scan's scan_time, or the smallest gap seen if that is 0.
+*/
+void CLaserOdometry2DNode::warnOnSkippedScan()
 {
-  return new_scan_available;
+  const rclcpp::Time stamp(last_scan.header.stamp);
+  if (last_scan_stamp.nanoseconds() > 0)
+  {
+    const double gap = (stamp - last_scan_stamp).seconds();
+    if (gap > 0.0 && (min_scan_gap <= 0.0 || gap < min_scan_gap))
+      min_scan_gap = gap;
+    const double period = last_scan.scan_time > 0.0f ? last_scan.scan_time : min_scan_gap;
+    if (period > 0.0 && gap > 1.5 * period)
+      RCLCPP_WARN(get_logger(), "Scan gap %.3fs is %.1f scan periods; a scan was skipped",
+                  gap, gap / period);
+  }
+  last_scan_stamp = stamp;
 }
 
 
 /**
- * Process the last scans to estimate the current odometry
+ * Estimate the odometry from last_scan against the previous scan and publish it
 */
 void CLaserOdometry2DNode::process()
 {
-  // Do only run when a new scan is ready 
-  if( rf2o_ref.is_initialized() && scan_available() )
+  if (rf2o_ref.is_initialized())
   {
     // Refresh the laser->base_frame_id extrinsic every scan, not just once
     // at startup -- the sensor mount isn't assumed rigid (e.g. a
@@ -201,14 +228,6 @@ void CLaserOdometry2DNode::process()
 
     // Publish odometry over ROS2 (tf/topic)
     publish();
-
-    // Do not run on the same data!
-    new_scan_available = false;
-  }
-  else
-  {
-    // This is a warning. We depend on laser scans, so no meaning running faster than scan freq.
-    RCLCPP_WARN(get_logger(), "Waiting for laser_scans....");
   }
 }
 
@@ -314,17 +333,9 @@ void CLaserOdometry2DNode::publish()
 int main(int argc, char** argv)
 {
   rclcpp::init(argc, argv);
-  auto myLaserOdomNode = std::make_shared<rf2o::CLaserOdometry2DNode>();
-
-  // set desired loop rate
-  rclcpp::Rate rate(myLaserOdomNode->freq);
-
-  // Loop
-  while (rclcpp::ok()){ 
-      rclcpp::spin_some(myLaserOdomNode);
-      myLaserOdomNode->process();
-      rate.sleep();
-  }
+  // Scan-driven: LaserCallBack does all the work, so there is no loop rate.
+  rclcpp::spin(std::make_shared<rf2o::CLaserOdometry2DNode>());
+  rclcpp::shutdown();
 
   return 0;
 }

@@ -18,12 +18,13 @@ public:
   void process();
   void publish();
   bool setLaserPoseFromTf();
-  bool scan_available();
+  void warnOnSkippedScan();
 
   // Params & vars
   CLaserOdometry2D    rf2o_ref;
-  bool                publish_tf, new_scan_available;
-  double              freq;
+  bool                publish_tf;
+  rclcpp::Time        last_scan_stamp{0, 0, RCL_ROS_TIME};
+  double              min_scan_gap = 0.0;
   // Reported measurement uncertainty (variances, not standard deviations)
   // for the published Odometry. Left at zero these read as "infinitely
   // certain" to any downstream Kalman filter -- see publish().
