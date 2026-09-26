@@ -58,6 +58,8 @@ result:
   constant-velocity prior.
 - **Dropped the `cmake_modules` dependency** (`c076912`), which isn't packaged
   for Humble.
+- **Dropped the unused `find_package(Boost)`** and declared the missing
+  `nav_msgs` dependency, so a clean `rosdep install` builds it.
 
 ## Scope
 
@@ -72,9 +74,9 @@ against wheel odometry, and every EKF/AMCL/SLAM parameter, belong to
   be roughly comparable to wheel encoders, never validated against the drift
   suite in `../sim/test/localization/`. Either measure them or expose them from
   `sentry_localization`'s launch so they can be tuned without a rebuild.
-- **Jazzy needs `CMAKE_CXX_STANDARD 17`** (it is 14), and the `tf2/*.h`
-  includes in `CLaserOdometry2DNode.hpp` should be checked for deprecation
-  warnings. `../JAZZY_PLAN.md`.
+- **Jazzy (`jazzy` branch):** C++17, `tf2`/`tf2_ros` includes switched to
+  `.hpp`, builds on `ros:jazzy` with no warnings under `-Wall -Wextra`.
+  `../JAZZY_PLAN.md`.
 
 ## Committing
 

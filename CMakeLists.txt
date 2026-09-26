@@ -3,7 +3,7 @@ project(rf2o_laser_odometry)
 
 
 if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 14)
+  set(CMAKE_CXX_STANDARD 17)
 endif()
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -21,7 +21,6 @@ find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 
 ## System dependencies are found with CMake's conventions
-find_package(Boost REQUIRED)
 find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
 
@@ -38,10 +37,6 @@ include_directories(
   include include/
 )
 
-include_directories(  
-  ${Boost_INCLUDE_DIRS}
-  ##${EIGEN3_INCLUDE_DIRS}
-)
 
 set(DEPENDENCIES
   "rclcpp"           
