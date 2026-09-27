@@ -72,9 +72,8 @@ against wheel odometry, and every EKF/AMCL/SLAM parameter, belong to
   be roughly comparable to wheel encoders, never validated against the drift
   suite in `../sim/test/localization/`. Either measure them or expose them from
   `sentry_localization`'s launch so they can be tuned without a rebuild.
-- **Jazzy needs `CMAKE_CXX_STANDARD 17`** (it is 14), and the `tf2/*.h`
-  includes in `CLaserOdometry2DNode.hpp` should be checked for deprecation
-  warnings. `../JAZZY_PLAN.md`.
+- **Jazzy:** ported on this repo's `jazzy` branch; its `AGENTS.md` has the
+  state. Commit Humble work here until the cutover.
 
 ## Committing
 
