@@ -62,12 +62,41 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(): Node("CLaserOdometry2DNode")
   this->declare_parameter<double>("angular_velocity_covariance", 0.1 * 0.1);
   this->get_parameter("angular_velocity_covariance", angular_velocity_covariance);
 
+  // Match confidence. Off by default (upstream behaviour); the quality
+  // topic is published either way. Defaults are unmeasured; see README.md.
+  this->declare_parameter<bool>("confidence_enabled", false);
+  this->get_parameter("confidence_enabled", confidence_enabled);
+  this->declare_parameter<double>("min_valid_fraction", 0.5);
+  this->get_parameter("min_valid_fraction", min_valid_fraction);
+  this->declare_parameter<double>("fail_valid_fraction", 0.25);
+  this->get_parameter("fail_valid_fraction", fail_valid_fraction);
+  this->declare_parameter<double>("max_match_sigma", 0.01);
+  this->get_parameter("max_match_sigma", max_match_sigma);
+  this->declare_parameter<double>("max_speed", 6.0);
+  this->get_parameter("max_speed", max_speed);
+  this->declare_parameter<double>("degraded_position_variance", 0.1 * 0.1);
+  this->get_parameter("degraded_position_variance", degraded_position_variance);
+  this->declare_parameter<double>("failed_variance_rate", 0.05);
+  this->get_parameter("failed_variance_rate", failed_variance_rate);
+  this->declare_parameter<double>("max_failed_variance", 1.0);
+  this->get_parameter("max_failed_variance", max_failed_variance);
+  this->declare_parameter<int>("recovery_matches", 20);
+  this->get_parameter("recovery_matches", recovery_matches);
+  // Only an applied check may reject a match inside rf2o; otherwise the
+  // quality topic reports what would have happened.
+  if (confidence_enabled)
+  {
+    rf2o_ref.fail_valid_fraction = fail_valid_fraction;
+    rf2o_ref.max_speed = max_speed;
+  }
+
   // Init Publishers and Subscribers
   //---------------------------------
   buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*buffer_);
   odom_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(this);
   odom_pub  = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic, 5);
+  quality_pub = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(odom_topic + "/quality", 10);
   // Every scan is matched against the one before it, so queue a burst
   // (a sim running faster than real time) instead of dropping to the newest.
   laser_sub = this->create_subscription<sensor_msgs::msg::LaserScan>(laser_scan_topic,rclcpp::QoS(rclcpp::KeepLast(10)).best_effort().durability_volatile(),
@@ -148,10 +177,12 @@ bool CLaserOdometry2DNode::setLaserPoseFromTf()
 {
   geometry_msgs::msg::TransformStamped tf_laser;
 
+  extrinsic_stale = true;
   try
   {
     tf_laser = buffer_->lookupTransform(base_frame_id, last_scan.header.frame_id,
                                         tf2_ros::fromMsg(last_scan.header.stamp));
+    extrinsic_stale = false;
   }
   catch (tf2::ExtrapolationException &)
   {
@@ -216,6 +247,7 @@ void CLaserOdometry2DNode::warnOnSkippedScan()
     if (gap > 0.0 && (min_scan_gap <= 0.0 || gap < min_scan_gap))
       min_scan_gap = gap;
     const double period = last_scan.scan_time > 0.0f ? last_scan.scan_time : min_scan_gap;
+    last_gap_periods = period > 0.0 ? gap / period : 0.0;
     if (period > 0.0 && gap > 1.5 * period)
       RCLCPP_WARN(get_logger(), "Scan gap %.3fs is %.1f scan periods; a scan was skipped",
                   gap, gap / period);
@@ -225,30 +257,166 @@ void CLaserOdometry2DNode::warnOnSkippedScan()
 
 
 /**
- * Estimate the odometry from last_scan against the previous scan and publish it
+ * Estimate the odometry from last_scan against the previous scan, grade the
+ * match, and publish it. With confidence_enabled, a failed match advances
+ * the pose by wheel odometry's increment instead (or publishes nothing if
+ * there is none) and every match's covariance follows its tier.
 */
 void CLaserOdometry2DNode::process()
 {
-  if (rf2o_ref.is_initialized())
+  if (!rf2o_ref.is_initialized())
+    return;
+
+  // Refresh the laser->base_frame_id extrinsic every scan, not just once
+  // at startup -- the sensor mount isn't assumed rigid (e.g. a
+  // head-mounted lidar that pans independently of the base).
+  setLaserPoseFromTf();
+
+  // Replace the constant-velocity guess with measured motion, if any.
+  has_odom_prior = !odom_prior_topic.empty() && setOdomPrior();
+
+  const bool solved = rf2o_ref.odometryCalculation(last_scan);
+  const MatchQuality &q = rf2o_ref.getMatchQuality();
+
+  // Per-axis std-dev and axes of the match's x/y covariance, laser frame.
+  Eigen::Matrix2d cov_xy = q.cov.topLeftCorner<2, 2>().cast<double>();
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> eig(cov_xy);
+  const Eigen::Vector2d sigma = eig.eigenvalues().cwiseMax(0.0).cwiseSqrt();
+
+  std::string reason;
+  const Tier tier = classify(solved, q, sigma, reason);
+  const char *increment = solved ? "scan" : "none";
+
+  if (tier == Tier::FAILED && confidence_enabled)
   {
-    // Refresh the laser->base_frame_id extrinsic every scan, not just once
-    // at startup -- the sensor mount isn't assumed rigid (e.g. a
-    // head-mounted lidar that pans independently of the base). Safe to do
-    // per-scan: laser_pose_ (the scan-matched absolute laser pose) is
-    // computed independently of this extrinsic; only the final
-    // laser_pose_ -> robot_pose_ conversion uses it.
-    setLaserPoseFromTf();
-
-    // Replace the constant-velocity guess with measured motion, if any.
-    if (!odom_prior_topic.empty())
-      setOdomPrior();
-
-    // Process odometry estimation
-    rf2o_ref.odometryCalculation(last_scan);
-
-    // Publish odometry over ROS2 (tf/topic)
-    publish();
+    const double dt = (rf2o_ref.current_scan_time - rf2o_ref.last_odom_time).seconds();
+    failed_extra = std::min(max_failed_variance, failed_extra + failed_variance_rate * std::max(dt, 0.0));
+    recovery_step = failed_extra / std::max(recovery_matches, 1);
+    if (has_odom_prior)
+    {
+      // Discard the match (IMPLAUSIBLE_SPEED left the pose untouched too)
+      // and carry the pose on wheel odometry across this scan.
+      rf2o_ref.deadReckon(odom_prior_increment);
+      increment = "odom";
+    }
   }
+  else if (tier != Tier::FAILED)
+  {
+    failed_extra = std::max(0.0, failed_extra - recovery_step);
+  }
+
+  if (std::strcmp(increment, "none") == 0)
+  {
+    // Nothing moved the pose. Skip this scan's motion rather than let the
+    // next match span two scans with one scan's prior.
+    rf2o_ref.last_odom_time = rf2o_ref.current_scan_time;
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+      "Scan match failed (%s), not publishing", reason.c_str());
+    publishQuality(tier, reason, q, sigma, increment);
+    return;
+  }
+
+  // Position covariance in odom_frame_id: the floor, plus the tier's
+  // inflation along each weak axis of the match, rotated out of the laser
+  // frame through the previous laser pose.
+  Eigen::Matrix2d cov = Eigen::Matrix2d::Identity() * position_covariance;
+  if (confidence_enabled)
+  {
+    Eigen::Matrix2d extra_laser = Eigen::Matrix2d::Zero();
+    if (tier == Tier::DEGRADED)
+    {
+      const bool few_points = q.points > 0 &&
+          double(q.valid_points) / q.points < min_valid_fraction;
+      for (int i = 0; i < 2; i++)
+      {
+        if (few_points || !q.finest_level_solved || extrinsic_stale ||
+            sigma(i) > max_match_sigma || last_gap_periods > 1.5)
+          extra_laser += degraded_position_variance *
+              eig.eigenvectors().col(i) * eig.eigenvectors().col(i).transpose();
+      }
+    }
+    const Eigen::Matrix2d R = rf2o_ref.laser_oldpose_.rotation().topLeftCorner<2, 2>();
+    cov += R * extra_laser * R.transpose();
+    cov += Eigen::Matrix2d::Identity() * failed_extra;
+  }
+
+  publishQuality(tier, reason, q, sigma, increment);
+  publish(cov);
+}
+
+
+/**
+ * Grade a match from the matcher's own evidence; /odom is never compared
+ * against, so wheel slip can't lower confidence. reason names every
+ * threshold crossed.
+ */
+CLaserOdometry2DNode::Tier CLaserOdometry2DNode::classify(
+    bool solved, const MatchQuality &q, const Eigen::Vector2d &sigma, std::string &reason) const
+{
+  const double valid_fraction = q.points > 0 ? double(q.valid_points) / q.points : 0.0;
+  if (!solved)
+  {
+    reason = failureName(q.failure);
+    return Tier::FAILED;
+  }
+  if (valid_fraction < fail_valid_fraction)
+  {
+    reason = "few_points";  // only reachable with confidence off
+    return Tier::FAILED;
+  }
+  if (max_speed > 0.0 && q.speed > max_speed)
+  {
+    reason = "implausible_speed";  // likewise
+    return Tier::FAILED;
+  }
+
+  std::vector<std::string> why;
+  if (valid_fraction < min_valid_fraction) why.push_back("valid_fraction");
+  if (!q.finest_level_solved) why.push_back("finest_level");
+  if (sigma.maxCoeff() > max_match_sigma) why.push_back("sigma");
+  if (last_gap_periods > 1.5) why.push_back("scan_gap");
+  if (extrinsic_stale) why.push_back("extrinsic_stale");
+  reason.clear();
+  for (const auto &w : why)
+    reason += (reason.empty() ? "" : ",") + w;
+  return why.empty() ? Tier::GOOD : Tier::DEGRADED;
+}
+
+
+/**
+ * One DiagnosticArray per scan on <odom_topic>/quality, stamped with the
+ * scan's stamp: the tier as the status level, the signals as values.
+ */
+void CLaserOdometry2DNode::publishQuality(Tier tier, const std::string &reason,
+    const MatchQuality &q, const Eigen::Vector2d &sigma, const char *increment)
+{
+  diagnostic_msgs::msg::DiagnosticArray arr;
+  arr.header.stamp = rf2o_ref.current_scan_time;
+  arr.header.frame_id = base_frame_id;
+  diagnostic_msgs::msg::DiagnosticStatus st;
+  st.name = std::string(get_name()) + ": scan match";
+  static const char *names[] = {"good", "degraded", "failed"};
+  st.level = tier == Tier::GOOD ? st.OK : tier == Tier::DEGRADED ? st.WARN : st.ERROR;
+  st.message = names[int(tier)];
+  if (!reason.empty())
+    st.message += " (" + reason + ")";
+  auto kv = [&st](const std::string &k, const std::string &v) {
+    diagnostic_msgs::msg::KeyValue p; p.key = k; p.value = v; st.values.push_back(p);
+  };
+  kv("tier", names[int(tier)]);
+  kv("applied", confidence_enabled ? "true" : "false");
+  kv("increment", increment);
+  kv("valid_fraction", std::to_string(q.points > 0 ? double(q.valid_points) / q.points : 0.0));
+  kv("levels_solved", std::to_string(q.levels_solved));
+  kv("finest_level_solved", q.finest_level_solved ? "true" : "false");
+  kv("sigma_max_m", std::to_string(sigma.maxCoeff()));
+  kv("sigma_min_m", std::to_string(sigma.minCoeff()));
+  kv("speed_mps", std::to_string(q.speed));
+  kv("scan_gap_periods", std::to_string(last_gap_periods));
+  kv("extrinsic_stale", extrinsic_stale ? "true" : "false");
+  kv("failed_extra_m2", std::to_string(failed_extra));
+  arr.status.push_back(st);
+  quality_pub->publish(arr);
 }
 
 
@@ -327,6 +495,7 @@ bool CLaserOdometry2DNode::setOdomPrior()
   Pose3d robot_inc = Pose3d::Identity();
   robot_inc.linear() = rf2o::matrixYaw(std::remainder(p1.yaw - p0.yaw, 2.0 * M_PI));
   robot_inc.translation() << c * dx + s * dy, -s * dx + c * dy, 0.0;
+  odom_prior_increment = robot_inc;
   const Pose3d laser_inc =
     rf2o_ref.laser_pose_on_robot_inv_ * robot_inc * rf2o_ref.laser_pose_on_robot_;
 
@@ -357,7 +526,7 @@ void CLaserOdometry2DNode::initPoseCallBack(const nav_msgs::msg::Odometry::Share
  * Publish current odocmetry estimation over ROS
  * According to the node parameters it will publish over tf and/or especified topic
 */
-void CLaserOdometry2DNode::publish()
+void CLaserOdometry2DNode::publish(const Eigen::Matrix2d &position_cov)
 {
   // 1. publish odom as a topic (no harm!)
   RCLCPP_DEBUG(get_logger(), "Publishing odom over topic:[%s]", odom_topic.c_str());
@@ -395,8 +564,10 @@ void CLaserOdometry2DNode::publish()
   // so that a consumer configured to fuse them treats them as
   // uninformative instead of perfectly known.
   const double UNOBSERVED = 1e6;
-  odom.pose.covariance[0]  = position_covariance;   // x
-  odom.pose.covariance[7]  = position_covariance;   // y
+  odom.pose.covariance[0]  = position_cov(0, 0);    // x
+  odom.pose.covariance[1]  = position_cov(0, 1);
+  odom.pose.covariance[6]  = position_cov(1, 0);
+  odom.pose.covariance[7]  = position_cov(1, 1);    // y
   odom.pose.covariance[14] = UNOBSERVED;            // z
   odom.pose.covariance[21] = UNOBSERVED;            // roll
   odom.pose.covariance[28] = UNOBSERVED;            // pitch
