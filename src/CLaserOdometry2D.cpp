@@ -204,6 +204,8 @@ bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& sc
   //	DIFERENTIAL  ODOMETRY  MULTILEVEL
   //=====================================
 
+  quality_ = MatchQuality();
+
   // copy @param scan to internal variable (we already did it for the previous scan)
   range_wf = Eigen::Map<const Eigen::MatrixXf>(scan.ranges.data(), width, 1);
 
@@ -241,6 +243,11 @@ bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& sc
 
     // 3. Find null points
     findNullPoints();
+    if (i == ctf_levels - 1)
+    {
+      quality_.valid_points = num_valid_range;
+      quality_.points = cols_i > 2 ? cols_i - 2 : 0;  // findNullPoints skips both ends
+    }
 
     // 4. Compute derivatives
     calculaterangeDerivativesSurface();
@@ -259,18 +266,55 @@ bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& sc
     }
     else
     {
-      /// @todo At initialization something
-      /// isn't properly initialized so that
-      /// uninitialized values get propagated
-      /// from 'filterLevelSolution' first call
-      /// Throughout the whole execution. Thus
-      /// this 'continue' that surprisingly works.
+      // Too few points to solve: this level's transform stays identity.
+      // A scan where every level lands here is a failed match (below),
+      // not zero motion.
       continue;
     }
 
     // 8. Filter solution
-    if (!filterLevelSolution()) return false;
+    if (!filterLevelSolution())
+    {
+      quality_.failure = MatchQuality::Failure::EIGENSOLVER;
+      return false;
+    }
+    quality_.levels_solved++;
+    quality_.finest_level_solved = (i == ctf_levels - 1);
+    quality_.cov = cov_odo;
   } // end pyramid lvls
+
+  if (quality_.levels_solved == 0)
+  {
+    quality_.failure = MatchQuality::Failure::NO_LEVELS;
+    return false;
+  }
+  if (quality_.points > 0 &&
+      double(quality_.valid_points) / quality_.points < fail_valid_fraction)
+  {
+    quality_.failure = MatchQuality::Failure::FEW_POINTS;
+    return false;
+  }
+
+  Eigen::Matrix3f acu_trans;
+  acu_trans.setIdentity();
+  for (unsigned int i=1; i<=ctf_levels; i++)
+    acu_trans = transformations[i-1]*acu_trans;
+
+  // Physical plausibility of the robot's motion, not agreement with any
+  // other odometry source.
+  const double time_inc_sec = (current_scan_time - last_odom_time).seconds();
+  if (time_inc_sec > 0.0)
+  {
+    Pose3d laser_inc = Pose3d::Identity();
+    laser_inc.translation() << acu_trans(0,2), acu_trans(1,2), 0.0;
+    const Pose3d robot_inc = laser_pose_on_robot_ * laser_inc * laser_pose_on_robot_inv_;
+    quality_.speed = robot_inc.translation().head<2>().norm() / time_inc_sec;
+    if (max_speed > 0.0 && quality_.speed > max_speed)
+    {
+      quality_.failure = MatchQuality::Failure::IMPLAUSIBLE_SPEED;
+      return false;
+    }
+  }
 
   // Get computation time 
   auto m_runtime = get_clock()->now() - start;
@@ -278,9 +322,35 @@ bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& sc
                 m_runtime.seconds()*double(1000));
 
   // Update poses with the new odom
-  PoseUpdate();
+  PoseUpdate(acu_trans);
 
   return true;
+}
+
+
+void CLaserOdometry2D::deadReckon(const Pose3d& robot_increment)
+{
+  const Pose3d laser_inc = laser_pose_on_robot_inv_ * robot_increment * laser_pose_on_robot_;
+  const float yaw = rf2o::getYaw(laser_inc.rotation());
+  Eigen::Matrix3f acu_trans;
+  acu_trans << std::cos(yaw), -std::sin(yaw), laser_inc.translation()(0),
+               std::sin(yaw),  std::cos(yaw), laser_inc.translation()(1),
+               0.f, 0.f, 1.f;
+  PoseUpdate(acu_trans);
+}
+
+
+const char* failureName(MatchQuality::Failure f)
+{
+  switch (f)
+  {
+    case MatchQuality::Failure::NONE: return "none";
+    case MatchQuality::Failure::NO_LEVELS: return "no_levels";
+    case MatchQuality::Failure::FEW_POINTS: return "few_points";
+    case MatchQuality::Failure::EIGENSOLVER: return "eigensolver";
+    case MatchQuality::Failure::IMPLAUSIBLE_SPEED: return "implausible_speed";
+  }
+  return "unknown";
 }
 
 
@@ -915,15 +985,8 @@ bool CLaserOdometry2D::filterLevelSolution()
  * Updates the laser and robot poses after analyzing the last scan
  * To do so, we need to analyze the coarse2fine pyramid
 */
-void CLaserOdometry2D::PoseUpdate()
+void CLaserOdometry2D::PoseUpdate(const Eigen::Matrix3f& acu_trans)
 {
-  // First, compute the overall transformation
-  Eigen::Matrix3f acu_trans;
-  acu_trans.setIdentity();
-
-  for (unsigned int i=1; i<=ctf_levels; i++)
-    acu_trans = transformations[i-1]*acu_trans;
-
   //				Compute kai_loc and kai_abs
   //--------------------------------------------------------
   kai_loc_(0) = fps*acu_trans(0,2);

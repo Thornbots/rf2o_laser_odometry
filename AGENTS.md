@@ -56,6 +56,17 @@ result:
   order, so a scan that lands before the odom covering its stamp uses the
   newest odom pose, up to 0.05 s old; past that it falls back to the
   constant-velocity prior.
+- **Match grading** (`confidence_enabled`, default `false`). Each match is
+  graded good / degraded / failed from the matcher's own evidence
+  (`MatchQuality` in `CLaserOdometry2D.hpp`), never from `odom_prior_topic`.
+  Degraded inflates x/y covariance along the match's weak axes; failed
+  discards the match and advances the pose by the odom prior's increment.
+  Grades go out on `<odom_topic>/quality` (`DiagnosticArray`) in every
+  mode. `sentry_localization/config/rf2o.yaml` holds the values and
+  `../sentry_localization/README.md` the rationale.
+- **A failed match no longer republishes the old pose**, and a scan with
+  too few points on every pyramid level fails (`NO_LEVELS`) instead of
+  integrating zero motion. Both apply with grading off.
 - **Dropped the `cmake_modules` dependency** (`c076912`), which isn't packaged
   for Humble.
 - **Dropped the unused `find_package(Boost)`** and declared the missing
@@ -68,12 +79,22 @@ against wheel odometry, and every EKF/AMCL/SLAM parameter, belong to
 `../sentry_localization`. The `/scan` this consumes is produced by
 `../thornbots_pkg`'s `lidar_self_filter`, not by the raw driver.
 
+## Testing
+
+`test/test_match_quality.cpp` (gtest) covers grading and `deadReckon()` on
+synthetic square-room scans:
+`../isaac_ros_common/scripts/dexec.sh -- colcon test --packages-select rf2o_laser_odometry`.
+Synthetic scans need noise: identical noiseless scans make every range
+derivative zero and rf2o's weights NaN (an eigensolver failure).
+
 ## Open
 
-- **The covariance defaults are guesses, not measurements.** They were picked to
-  be roughly comparable to wheel encoders, never validated against the drift
-  suite in `../sim/test/localization/`. Either measure them or expose them from
-  `sentry_localization`'s launch so they can be tuned without a rebuild.
+- **The covariance and grading thresholds are guesses, not measurements.**
+  They now live in `../sentry_localization/config/rf2o.yaml`, tunable without
+  a rebuild. Set them from `/scan_odom/quality` over the drift suite.
+- **`package.xml` is format 1**, which is deprecated and has no
+  `test_depend`, so `ament_cmake_gtest` is a `build_depend`. Moving to
+  format 3 is its own change.
 - **Jazzy:** C++17, `tf2`/`tf2_ros` includes switched to
   `.hpp`, no warnings under `-Wall -Wextra`. The drift suite and
   `suite:=ekf` give Humble's verdicts with it on the laptop.

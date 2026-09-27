@@ -69,6 +69,24 @@ using Pose3d = Eigen::Isometry3d;
 using MatrixS31 = Eigen::Matrix<Scalar, 3, 1>;
 using IncrementCov = Eigen::Matrix<Scalar, 3, 3>;
 
+// How well the last odometryCalculation() went, from the matcher's own
+// evidence only. Filled on every call, success or not.
+struct MatchQuality
+{
+  enum class Failure { NONE, NO_LEVELS, FEW_POINTS, EIGENSOLVER, IMPLAUSIBLE_SPEED };
+  Failure failure = Failure::NONE;
+  unsigned int levels_solved = 0;
+  bool finest_level_solved = false;
+  unsigned int valid_points = 0;   // at the finest level
+  unsigned int points = 0;         // at the finest level
+  // Last solved level's increment covariance, laser frame (x, y, yaw),
+  // m^2 and rad^2 per scan.
+  IncrementCov cov = IncrementCov::Zero();
+  double speed = 0.0;              // robot-frame translation / scan gap, m/s
+};
+
+const char* failureName(MatchQuality::Failure f);
+
 
 class CLaserOdometry2D: public rclcpp::Node
 {
@@ -88,6 +106,19 @@ public:
   const Pose3d& getIncrement() const;
 
   const IncrementCov& getIncrementCovariance() const;
+
+  const MatchQuality& getMatchQuality() const { return quality_; }
+
+  // Advance the pose by a robot-frame increment in place of a scan match,
+  // e.g. wheel odometry's motion across a scan the matcher failed on.
+  void deadReckon(const Pose3d& robot_increment);
+
+  // A match whose robot translation over the scan gap exceeds this is
+  // rejected as IMPLAUSIBLE_SPEED. 0 disables the check.
+  double max_speed = 0.0;
+  // A scan whose finest level has fewer valid points than this fraction is
+  // rejected as FEW_POINTS. 0 disables the check.
+  double fail_valid_fraction = 0.0;
 
   Pose3d& getPose();
   const Pose3d& getPose() const;
@@ -172,7 +203,8 @@ public:
   void solveSystemOneLevel();
   void solveSystemNonLinear();
   bool filterLevelSolution();
-  void PoseUpdate();
+  void PoseUpdate(const Eigen::Matrix3f& acu_trans);
+  MatchQuality quality_;
   void Reset(const Pose3d& ini_pose/*, CObservation2DRangeScan scan*/);
 };
 

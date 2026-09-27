@@ -19,6 +19,7 @@ find_package(tf2  REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 
 ## System dependencies are found with CMake's conventions
 find_package(eigen3_cmake_module REQUIRED)
@@ -47,6 +48,7 @@ set(DEPENDENCIES
   "tf2_ros"
   "sensor_msgs"
   "nav_msgs"
+  "diagnostic_msgs"
   "eigen3_cmake_module"
 )
 
@@ -65,6 +67,12 @@ install(TARGETS ${EXECUTABLE_NAME}
 install(
   DIRECTORY launch  
   DESTINATION share/${PROJECT_NAME})
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_match_quality test/test_match_quality.cpp)
+  target_link_libraries(test_match_quality ${PROJECT_NAME})
+endif()
 
 ament_package()
 

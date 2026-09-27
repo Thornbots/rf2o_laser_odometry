@@ -8,8 +8,13 @@
 #include <tf2/impl/utils.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2/utils.hpp>
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
 
+#include <algorithm>
+#include <cstring>
 #include <deque>
+#include <string>
+#include <vector>
 
 namespace rf2o {
 
@@ -17,8 +22,10 @@ class CLaserOdometry2DNode : public rclcpp::Node
 {
 public:
   CLaserOdometry2DNode();
+  enum class Tier { GOOD, DEGRADED, FAILED };
+
   void process();
-  void publish();
+  void publish(const Eigen::Matrix2d &position_cov);
   bool setLaserPoseFromTf();
   void warnOnSkippedScan();
 
@@ -41,6 +48,24 @@ public:
   std::string         init_pose_from_topic;
   std::string         odom_prior_topic;
 
+  // Match confidence; see README.md. Signals are always computed and
+  // published on <odom_topic>/quality; confidence_enabled applies them.
+  bool                confidence_enabled;
+  double              min_valid_fraction;     // below: degraded
+  double              fail_valid_fraction;    // below: failed
+  double              max_match_sigma;        // m, per axis; above: degraded
+  double              max_speed;              // m/s; above: failed
+  double              degraded_position_variance;  // m^2, added per weak axis
+  double              failed_variance_rate;   // m^2/s while failed
+  double              max_failed_variance;    // m^2 cap
+  int                 recovery_matches;       // good matches to shed it
+  double              failed_extra = 0.0;     // current added variance, m^2
+  double              recovery_step = 0.0;
+  bool                extrinsic_stale = false;
+  double              last_gap_periods = 0.0;
+  bool                has_odom_prior = false;
+  Pose3d              odom_prior_increment = Pose3d::Identity();
+
   sensor_msgs::msg::LaserScan                     last_scan;
   bool                                            GT_pose_initialized;
   std::shared_ptr<tf2_ros::Buffer>                buffer_;
@@ -59,6 +84,12 @@ public:
   bool odomPriorAt(double t, OdomSample &out) const;
   bool setOdomPrior();
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr         odom_pub;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr quality_pub;
+
+  Tier classify(bool solved, const MatchQuality &q, const Eigen::Vector2d &sigma,
+                std::string &reason) const;
+  void publishQuality(Tier tier, const std::string &reason, const MatchQuality &q,
+                      const Eigen::Vector2d &sigma, const char *increment);
 
   // CallBacks
   void LaserCallBack(const sensor_msgs::msg::LaserScan::SharedPtr new_scan);
