@@ -74,7 +74,7 @@ against wheel odometry, and every EKF/AMCL/SLAM parameter, belong to
   be roughly comparable to wheel encoders, never validated against the drift
   suite in `../sim/test/localization/`. Either measure them or expose them from
   `sentry_localization`'s launch so they can be tuned without a rebuild.
-- **Jazzy (this branch):** C++17, `tf2`/`tf2_ros` includes switched to
+- **Jazzy:** C++17, `tf2`/`tf2_ros` includes switched to
   `.hpp`, no warnings under `-Wall -Wextra`. The drift suite and
   `suite:=ekf` give Humble's verdicts with it on the laptop.
 
