@@ -63,7 +63,7 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(): Node("CLaserOdometry2DNode")
   this->get_parameter("angular_velocity_covariance", angular_velocity_covariance);
 
   // Match confidence. Off by default (upstream behaviour); the quality
-  // topic is published either way. Defaults are unmeasured; see README.md.
+  // topic is published either way. sentry_localization's rf2o.yaml has the tuned values.
   this->declare_parameter<bool>("confidence_enabled", false);
   this->get_parameter("confidence_enabled", confidence_enabled);
   this->declare_parameter<double>("min_valid_fraction", 0.5);
