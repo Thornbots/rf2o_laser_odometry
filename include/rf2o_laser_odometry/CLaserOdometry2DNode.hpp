@@ -55,6 +55,7 @@ public:
   double              fail_valid_fraction;    // below: failed
   double              max_match_sigma;        // m, per axis; above: degraded
   double              max_speed;              // m/s; above: failed
+  double              max_extrinsic_age;      // s the latest extrinsic may trail the scan
   double              degraded_position_variance;  // m^2, added per weak axis
   double              failed_variance_rate;   // m^2/s while failed
   double              max_failed_variance;    // m^2 cap
@@ -62,6 +63,7 @@ public:
   double              failed_extra = 0.0;     // current added variance, m^2
   double              recovery_step = 0.0;
   bool                extrinsic_stale = false;
+  double              extrinsic_age = 0.0;    // s behind the scan; -1 if lookups failed
   double              last_gap_periods = 0.0;
   bool                has_odom_prior = false;
   Pose3d              odom_prior_increment = Pose3d::Identity();

@@ -74,6 +74,8 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(): Node("CLaserOdometry2DNode")
   this->get_parameter("max_match_sigma", max_match_sigma);
   this->declare_parameter<double>("max_speed", 6.0);
   this->get_parameter("max_speed", max_speed);
+  this->declare_parameter<double>("max_extrinsic_age", 0.1);
+  this->get_parameter("max_extrinsic_age", max_extrinsic_age);
   this->declare_parameter<double>("degraded_position_variance", 0.1 * 0.1);
   this->get_parameter("degraded_position_variance", degraded_position_variance);
   this->declare_parameter<double>("failed_variance_rate", 0.05);
@@ -170,25 +172,32 @@ void CLaserOdometry2DNode::LaserCallBack(const sensor_msgs::msg::LaserScan::Shar
    * Called every scan (not just once at startup) so a non-rigid sensor
    * mount (e.g. a lidar on a moving head joint) is tracked correctly.
    * Looked up at the scan's stamp, falling back to the latest transform
-   * when TF hasn't reached that stamp yet. Returns false, leaving the last
-   * known-good transform in place, if both lookups fail.
+   * when TF hasn't reached that stamp yet. That fallback is stale only if
+   * it is more than max_extrinsic_age older than the scan. Returns false,
+   * leaving the last known-good transform in place, if both lookups fail.
    */
 bool CLaserOdometry2DNode::setLaserPoseFromTf()
 {
   geometry_msgs::msg::TransformStamped tf_laser;
 
   extrinsic_stale = true;
+  extrinsic_age = -1.0;
   try
   {
     tf_laser = buffer_->lookupTransform(base_frame_id, last_scan.header.frame_id,
                                         tf2_ros::fromMsg(last_scan.header.stamp));
     extrinsic_stale = false;
+    extrinsic_age = 0.0;
   }
   catch (tf2::ExtrapolationException &)
   {
     try
     {
       tf_laser = buffer_->lookupTransform(base_frame_id, last_scan.header.frame_id, tf2::TimePointZero);
+      // Joint-driven TF usually trails the scan by a joint_states period.
+      extrinsic_age = std::abs((rclcpp::Time(last_scan.header.stamp) -
+                                rclcpp::Time(tf_laser.header.stamp)).seconds());
+      extrinsic_stale = extrinsic_age > max_extrinsic_age;
     }
     catch (tf2::TransformException &ex)
     {
@@ -414,6 +423,7 @@ void CLaserOdometry2DNode::publishQuality(Tier tier, const std::string &reason,
   kv("speed_mps", std::to_string(q.speed));
   kv("scan_gap_periods", std::to_string(last_gap_periods));
   kv("extrinsic_stale", extrinsic_stale ? "true" : "false");
+  kv("extrinsic_age_s", std::to_string(extrinsic_age));
   kv("failed_extra_m2", std::to_string(failed_extra));
   arr.status.push_back(st);
   quality_pub->publish(arr);

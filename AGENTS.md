@@ -43,7 +43,8 @@ result:
   wall-clock `rclcpp::Rate` with a depth-1 queue, so a sim at 10x skipped four
   scans in five. Now every scan is matched in its callback (queue depth 10, a
   warning on any skipped scan), the `freq` param is gone, and the extrinsic is
-  looked up at the scan's stamp, falling back to the latest transform.
+  looked up at the scan's stamp, falling back to the latest transform
+  (graded stale past `max_extrinsic_age`, 0.1 s).
 - **`fixed_heading` parameter** (default `false`). When true,
   the robot's yaw is pinned to its initial pose after each match; the laser
   pose is rebuilt through the live extrinsic, so a panning head is still
