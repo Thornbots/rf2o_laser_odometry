@@ -10,7 +10,7 @@ algorithm; the paper it cites is the reference for anything in
 ## How the Sentry actually uses it
 
 Launched only by `../sentry_localization`'s `localization.launch.py`, and only
-when `use_ekf:=true`. It reads `/scan`, publishes `/scan_odom`, and
+when `use_rf2o:=true`. It reads `/scan`, publishes `/scan_odom`, and
 `publish_tf` is **false** — `robot_localization`'s EKF owns `odom->root`, not
 this node. `base_frame_id` is `root`. It matches every scan in the scan
 callback with no loop rate, so it keeps up with a sim faster than real time as
