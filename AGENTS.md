@@ -90,9 +90,9 @@ derivative zero and rf2o's weights NaN (an eigensolver failure).
 
 ## Open
 
-- **The covariance and grading thresholds are guesses, not measurements.**
-  They now live in `../sentry_localization/config/rf2o.yaml`, tunable without
-  a rebuild. Set them from `/scan_odom/quality` over the drift suite.
+- **The covariance values are guesses; the grade thresholds are measured.**
+  All live in `../sentry_localization/config/rf2o.yaml`, tunable without a
+  rebuild; its README.md has the drift-suite distributions.
 - **`package.xml` is format 1**, which is deprecated and has no
   `test_depend`, so `ament_cmake_gtest` is a `build_depend`. Moving to
   format 3 is its own change.
