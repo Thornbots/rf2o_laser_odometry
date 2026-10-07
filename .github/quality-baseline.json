@@ -1,0 +1,21 @@
+{
+  "[\"launch/rf2o_laser_odometry.launch.py\", \"F401\", \"`ament_index_python.packages.get_package_share_directory` imported but unused\"]": 1,
+  "[\"launch/rf2o_laser_odometry.launch.py\", \"F401\", \"`launch.actions.DeclareLaunchArgument` imported but unused\"]": 1,
+  "[\"launch/rf2o_laser_odometry.launch.py\", \"F401\", \"`launch.actions.ExecuteProcess` imported but unused\"]": 1,
+  "[\"launch/rf2o_laser_odometry.launch.py\", \"F401\", \"`launch.actions.IncludeLaunchDescription` imported but unused\"]": 1,
+  "[\"launch/rf2o_laser_odometry.launch.py\", \"F401\", \"`launch.conditions.IfCondition` imported but unused\"]": 1,
+  "[\"launch/rf2o_laser_odometry.launch.py\", \"F401\", \"`launch.conditions.UnlessCondition` imported but unused\"]": 1,
+  "[\"launch/rf2o_laser_odometry.launch.py\", \"F401\", \"`launch.launch_description_sources.PythonLaunchDescriptionSource` imported but unused\"]": 1,
+  "[\"launch/rf2o_laser_odometry.launch.py\", \"F401\", \"`launch.substitutions.LaunchConfiguration` imported but unused\"]": 1,
+  "[\"launch/rf2o_laser_odometry.launch.py\", \"F401\", \"`launch.substitutions.PythonExpression` imported but unused\"]": 1,
+  "[\"launch/rf2o_laser_odometry.launch.py\", \"F401\", \"`launch.substitutions.ThisLaunchFileDir` imported but unused\"]": 1,
+  "[\"launch/rf2o_laser_odometry.launch.py\", \"F401\", \"`os` imported but unused\"]": 1,
+  "[\"launch/rf2o_laser_odometry.launch.py\", \"F401\", \"`pathlib.Path` imported but unused\"]": 1,
+  "[\"src/CLaserOdometry2D.cpp\", \"readability/casting\", \"Using C-style cast.  Use static_cast<int>(...) instead\"]": 2,
+  "[\"src/CLaserOdometry2D.cpp\", \"readability/casting\", \"Using deprecated casting style.  Use static_cast<double>(...) instead\"]": 3,
+  "[\"src/CLaserOdometry2D.cpp\", \"readability/casting\", \"Using deprecated casting style.  Use static_cast<float>(...) instead\"]": 18,
+  "[\"src/CLaserOdometry2D.cpp\", \"readability/casting\", \"Using deprecated casting style.  Use static_cast<int>(...) instead\"]": 3,
+  "[\"src/CLaserOdometry2DNode.cpp\", \"readability/casting\", \"Using deprecated casting style.  Use static_cast<double>(...) instead\"]": 3,
+  "[\"src/CLaserOdometry2DNode.cpp\", \"readability/casting\", \"Using deprecated casting style.  Use static_cast<int>(...) instead\"]": 2,
+  "[\"test/test_match_quality.cpp\", \"readability/casting\", \"Using deprecated casting style.  Use static_cast<double>(...) instead\"]": 3
+}
