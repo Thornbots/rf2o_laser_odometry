@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, nightly]
   pull_request:
-    branches-ignore: [humble, 'humble/**']
+    branches: [main, nightly]
   workflow_dispatch:
 
 permissions:
@@ -23,4 +23,4 @@ jobs:
     uses: Thornbots/thornbots_workspace/.github/workflows/ros.yml@58b7bf0d7bd68ea591d5bd30d34177002b9be42a
     with:
       package-repo: rf2o_laser_odometry
-      workspace-ref: 58b7bf0d7bd68ea591d5bd30d34177002b9be42a
+      workspace-ref: 6e8968e07aab9efacb101e86851b656faa63bd90
