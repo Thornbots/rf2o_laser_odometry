@@ -1,115 +1,27 @@
-# rf2o_laser_odometry: agent notes
+# rf2o_laser_odometry
 
-Vendored fork of
-[MAPIRlab/rf2o_laser_odometry](https://github.com/MAPIRlab/rf2o_laser_odometry),
-scan-to-scan planar odometry. **The default branch is `main`** (renamed from `ros2`). Upstream's `README.md` describes the range-flow
-algorithm; the paper it cites is the reference for anything in
-`CLaserOdometry2D.cpp`.
-
-## How the Sentry actually uses it
-
-Launched only by `../sentry_localization`'s `localization.launch.py`, and only
-when `use_rf2o:=true`. It reads `/scan`, publishes `/scan_odom`, and
-`publish_tf` is **false** — `robot_localization`'s EKF owns `odom->root`, not
-this node. `base_frame_id` is `root`. It matches every scan in the scan
-callback with no loop rate, so it keeps up with a sim faster than real time as
-long as matching itself does.
-
-Why each of those values is what it is, and the measurement history behind them,
-lives in `../sentry_localization/README.md` (`## Notes`). Read that before
-retuning anything here.
-
-**This package is shadowed by `/workspaces/ros2_ws`** (`Dockerfile.thornbots`
-LAYER 5 copies this directory in at build time). Once it's built locally, an
-edit under `src/rf2o_laser_odometry` is live under `dexec.sh` but _not_ in the
-user's terminal, which resolves to the image-baked snapshot. Before trusting any
-result:
-`../isaac_ros_common/scripts/dexec.sh -- ros2 pkg prefix rf2o_laser_odometry`
-(`/workspaces/isaac_ros-dev/…` = your edit is live).
-
-## Thornbots changes to upstream
-
-- **Re-query the `laser -> base_frame_id` transform every scan** (`7a07a0f`).
-  Upstream sampled it once on the first scan, which is fine for a fixed lidar
-  and wrong for the Sentry's head-mounted one.
-- **Publish real covariance** (`78d6a05`). Upstream left `pose.covariance` and
-  `twist.covariance` all-zero, which a Kalman filter reads as "infinitely
-  certain." The diagonal now comes from four parameters — `position_covariance`
-  (default `0.02**2`), `yaw_covariance` (`0.05**2`),
-  `linear_velocity_covariance` (`0.05**2`), `angular_velocity_covariance`
-  (`0.1**2`) — with the unobserved z/roll/pitch axes set to `1e6`.
-- **Scan-driven, sim-time-safe processing.** Upstream matched on a 20 Hz
-  wall-clock `rclcpp::Rate` with a depth-1 queue, so a sim at 10x skipped four
-  scans in five. Now every scan is matched in its callback (queue depth 10, a
-  warning on any skipped scan), the `freq` param is gone, and the extrinsic is
-  looked up at the scan's stamp, falling back to the latest transform
-  (graded stale past `max_extrinsic_age`, 0.1 s).
-- **`fixed_heading` parameter** (default `false`). When true,
-  the robot's yaw is pinned to its initial pose after each match; the laser
-  pose is rebuilt through the live extrinsic, so a panning head is still
-  tracked. `sentry_localization` sets it true.
-- **`odom_prior_topic` parameter** (default empty, off). When set, each
-  match's velocity prior is that Odometry topic's motion between the two
-  scan stamps, in place of upstream's constant-velocity guess, which reads
-  "stopped" at the start of every move and pulls the match short.
-  `sentry_localization` sets `/odom`. Scans and odom are handled in arrival
-  order, so a scan that lands before the odom covering its stamp uses the
-  newest odom pose, up to 0.05 s old; past that it falls back to the
-  constant-velocity prior.
-- **Match grading** (`confidence_enabled`, default `false`). Each match is
-  graded good / degraded / failed from the matcher's own evidence
-  (`MatchQuality` in `CLaserOdometry2D.hpp`), never from `odom_prior_topic`.
-  Degraded inflates x/y covariance along the match's weak axes; failed
-  discards the match and advances the pose by the odom prior's increment.
-  Grades go out on `<odom_topic>/quality` (`DiagnosticArray`) in every
-  mode. `sentry_localization/config/rf2o.yaml` holds the values and
-  `../sentry_localization/README.md` the rationale.
-- **A failed match no longer republishes the old pose**, and a scan with
-  too few points on every pyramid level fails (`NO_LEVELS`) instead of
-  integrating zero motion. Both apply with grading off.
-- **Dropped the `cmake_modules` dependency** (`c076912`), which isn't packaged
-  for Humble.
-- **Dropped the unused `find_package(Boost)`** and declared the missing
-  `nav_msgs` dependency, so a clean `rosdep install` builds it.
+Follow [workspace rules](../AGENTS.md) and [CI](../docs/CI.md).
+Keep the diff to [upstream](README.md) small. Its range-flow paper is the
+algorithm reference. Read [Sentry tuning rationale](../sentry_localization/README.md#notes)
+before changing the estimator.
 
 ## Scope
 
-The odometry estimator and its message contract. How `/scan_odom` is weighted
-against wheel odometry, and every EKF/AMCL/SLAM parameter, belong to
-`../sentry_localization`. The `/scan` this consumes is produced by
-`../thornbots_pkg`'s `lidar_self_filter`, not by the raw driver.
+Own scan odometry and match grading. `sentry_localization` owns fusion/tuning
+and `odom->root`; `thornbots_pkg` supplies the filtered scan.
+Preserve the intentional upstream diffs: live head extrinsics, per-scan
+callback matching at scan stamps, real covariances, `fixed_heading`,
+`odom_prior_topic`, no republish after a failed match, and grading from matcher
+evidence, never agreement with the wheel-odometry prior.
+Parameter values live in source and `../sentry_localization/config/rf2o.yaml`.
 
 ## Testing
 
-`test/test_match_quality.cpp` (gtest) covers grading and `deadReckon()` on
-synthetic square-room scans:
-`../isaac_ros_common/scripts/dexec.sh -- colcon test --packages-select rf2o_laser_odometry`.
-Synthetic scans need noise: identical noiseless scans make every range
-derivative zero and rf2o's weights NaN (an eigensolver failure).
+Use noisy synthetic scans: identical noiseless scans yield zero derivatives
+and NaN weights. See `test/test_match_quality.cpp` and
+[quality recording](../sim/README.md#more-on-the-tests).
 
 ## Open
 
-- **The covariance values are guesses; the grade thresholds are measured.**
-  All live in `../sentry_localization/config/rf2o.yaml`, tunable without a
-  rebuild; its README.md has the drift-suite distributions.
-- **`package.xml` is format 1**, which is deprecated and has no
-  `test_depend`, so `ament_cmake_gtest` is a `build_depend`. Moving to
-  format 3 is its own change.
-- **Jazzy:** C++17, `tf2`/`tf2_ros` includes switched to
-  `.hpp`, no warnings under `-Wall -Wextra`. The drift suite and
-  `suite:=ekf` give Humble's verdicts with it on the laptop.
-
-## Committing
-
-This package is a submodule of `thornbots_workspace`, on branch `nightly`. Commit
-and push here first, then bump this gitlink in `../` — one logical change, one
-bump, never a gitlink pointing at an unpushed commit. Full rule in
-`../CLAUDE.md` § Packages.
-
-## CI
-
-GitHub CI runs on PRs targeting main/nightly and pushes to both branches;
-manual runs are available. Shared lint is pinned to workspace `884bfe63ea4e` (tag `ci-tooling-884bfe6`). Existing diagnostics are recorded in
-`.github/quality-baseline.json`; new diagnostics fail. Do not expand the
-baseline to hide regressions. Syntax errors always fail.
-Jazzy CI builds the portable stack and runs this package's registered tests.
+- Covariances are estimates; grade thresholds have drift-suite evidence.
+- `package.xml` is deprecated format 1; migration to format 3 is a separate change.
