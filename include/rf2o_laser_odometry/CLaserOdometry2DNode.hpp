@@ -11,8 +11,10 @@
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <deque>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -24,10 +26,13 @@ public:
   CLaserOdometry2DNode();
   enum class Tier { GOOD, DEGRADED, FAILED };
 
-  void process();
+  void process(bool exact_capture = false);
   void publish(const Eigen::Matrix2d &position_cov);
-  bool setLaserPoseFromTf();
+  bool setLaserPoseFromTf(bool exact_capture = false);
   void warnOnSkippedScan();
+  void processPendingScans();
+  bool strictPrerequisites(const sensor_msgs::msg::LaserScan &scan);
+  void publishReceipt(const sensor_msgs::msg::LaserScan &scan, bool published);
 
   // Params & vars
   CLaserOdometry2D    rf2o_ref;
@@ -47,6 +52,9 @@ public:
   std::string         odom_frame_id;
   std::string         init_pose_from_topic;
   std::string         odom_prior_topic;
+  bool                strict_capture = false;
+  std::string         consumed_topic;
+  double              minimum_scan_stamp_s = 0.0;
 
   // Match confidence; see README.md. Signals are always computed and
   // published on <odom_topic>/quality; confidence_enabled applies them.
@@ -84,9 +92,18 @@ public:
   struct OdomSample { double t, x, y, yaw; };
   std::deque<OdomSample>                                        odom_prior_buf;
   bool odomPriorAt(double t, OdomSample &out) const;
+  bool odomPriorBracketedAt(double t, OdomSample &out) const;
   bool setOdomPrior();
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr         odom_pub;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr quality_pub;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr consumed_pub;
+  rclcpp::TimerBase::SharedPtr strict_scan_timer;
+  struct PendingScan {
+    sensor_msgs::msg::LaserScan::SharedPtr scan;
+    std::chrono::steady_clock::time_point received;
+  };
+  std::deque<PendingScan> pending_scans;
+  std::optional<int64_t> published_scan_stamp_ns;
 
   Tier classify(bool solved, const MatchQuality &q, const Eigen::Vector2d &sigma,
                 std::string &reason) const;

@@ -17,6 +17,9 @@
 
 #include "rf2o_laser_odometry/CLaserOdometry2DNode.hpp"
 
+#include <cmath>
+#include <stdexcept>
+
 using namespace rf2o;
 
 CLaserOdometry2DNode::CLaserOdometry2DNode(): Node("CLaserOdometry2DNode")
@@ -47,6 +50,14 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(): Node("CLaserOdometry2DNode")
   // "stopped" at the start of every move and pulls the match short.
   this->declare_parameter<std::string>("odom_prior_topic", "");
   this->get_parameter("odom_prior_topic", odom_prior_topic);
+  this->declare_parameter<bool>("strict_capture", false);
+  this->get_parameter("strict_capture", strict_capture);
+  this->declare_parameter<std::string>("consumed_topic", "");
+  this->get_parameter("consumed_topic", consumed_topic);
+  this->declare_parameter<double>("minimum_scan_stamp_s", 0.0);
+  this->get_parameter("minimum_scan_stamp_s", minimum_scan_stamp_s);
+  if (!std::isfinite(minimum_scan_stamp_s) || minimum_scan_stamp_s < 0.0)
+    throw std::invalid_argument("minimum_scan_stamp_s must be finite and nonnegative");
 
   // Measurement uncertainty reported on the published Odometry (see
   // publish()). Defaults assume scan matching is noisier than wheel
@@ -99,10 +110,15 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(): Node("CLaserOdometry2DNode")
   odom_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(this);
   odom_pub  = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic, 5);
   quality_pub = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(odom_topic + "/quality", 10);
+  if (!consumed_topic.empty())
+    consumed_pub = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(consumed_topic, 100);
   // Every scan is matched against the one before it, so queue a burst
   // (a sim running faster than real time) instead of dropping to the newest.
   laser_sub = this->create_subscription<sensor_msgs::msg::LaserScan>(laser_scan_topic,rclcpp::QoS(rclcpp::KeepLast(10)).best_effort().durability_volatile(),
       std::bind(&CLaserOdometry2DNode::LaserCallBack, this, std::placeholders::_1));
+  if (strict_capture)
+    strict_scan_timer = create_wall_timer(std::chrono::milliseconds(1),
+      std::bind(&CLaserOdometry2DNode::processPendingScans, this));
   
   if (!odom_prior_topic.empty())
   {
@@ -143,6 +159,19 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(): Node("CLaserOdometry2DNode")
 */
 void CLaserOdometry2DNode::LaserCallBack(const sensor_msgs::msg::LaserScan::SharedPtr new_scan)
 {
+  if (strict_capture)
+  {
+    const double stamp_s = rclcpp::Time(new_scan->header.stamp).seconds();
+    if (stamp_s < minimum_scan_stamp_s)
+    {
+      publishReceipt(*new_scan, false);
+      return;
+    }
+    if (pending_scans.size() >= 100)
+      throw std::runtime_error("lockstep timeout: strict rf2o scan queue overflow");
+    pending_scans.push_back({new_scan, std::chrono::steady_clock::now()});
+    return;
+  }
   if (GT_pose_initialized)
   {
     last_scan = *new_scan;
@@ -165,6 +194,66 @@ void CLaserOdometry2DNode::LaserCallBack(const sensor_msgs::msg::LaserScan::Shar
   }
 }
 
+void CLaserOdometry2DNode::processPendingScans()
+{
+  while (!pending_scans.empty())
+  {
+    auto &pending = pending_scans.front();
+    if (std::chrono::steady_clock::now() - pending.received > std::chrono::seconds(2))
+      throw std::runtime_error("lockstep timeout: strict rf2o prerequisites for scan " +
+        std::to_string(rclcpp::Time(pending.scan->header.stamp).seconds()));
+    if (!strictPrerequisites(*pending.scan))
+      return;
+
+    last_scan = *pending.scan;
+    rf2o_ref.current_scan_time = last_scan.header.stamp;
+    published_scan_stamp_ns.reset();
+    if (rf2o_ref.first_laser_scan)
+    {
+      rf2o_ref.init(last_scan, initial_robot_pose.pose.pose);
+      rf2o_ref.first_laser_scan = false;
+    }
+    else
+    {
+      warnOnSkippedScan();
+      process(true);
+    }
+    const auto scan = pending.scan;
+    pending_scans.pop_front();
+    const int64_t scan_ns = rclcpp::Time(scan->header.stamp).nanoseconds();
+    publishReceipt(*scan, published_scan_stamp_ns && *published_scan_stamp_ns == scan_ns);
+  }
+}
+
+bool CLaserOdometry2DNode::strictPrerequisites(const sensor_msgs::msg::LaserScan &scan)
+{
+  if (!GT_pose_initialized)
+    return false;
+  last_scan = scan;
+  rf2o_ref.current_scan_time = scan.header.stamp;
+  if (!setLaserPoseFromTf(true))
+    return false;
+  if (rf2o_ref.first_laser_scan || odom_prior_topic.empty())
+    return true;
+  OdomSample previous, current;
+  return odomPriorBracketedAt(rf2o_ref.last_odom_time.seconds(), previous) &&
+         odomPriorBracketedAt(rf2o_ref.current_scan_time.seconds(), current);
+}
+
+void CLaserOdometry2DNode::publishReceipt(
+  const sensor_msgs::msg::LaserScan &scan, bool published)
+{
+  if (!consumed_pub)
+    return;
+  diagnostic_msgs::msg::DiagnosticArray receipt;
+  receipt.header = scan.header;
+  diagnostic_msgs::msg::DiagnosticStatus status;
+  status.name = get_name();
+  status.message = published ? "published" : "no_output";
+  receipt.status.push_back(status);
+  consumed_pub->publish(receipt);
+}
+
 
 /**
    * Gets the laser pose with respect the base_link (through TF)
@@ -176,7 +265,7 @@ void CLaserOdometry2DNode::LaserCallBack(const sensor_msgs::msg::LaserScan::Shar
    * it is more than max_extrinsic_age older than the scan. Returns false,
    * leaving the last known-good transform in place, if both lookups fail.
    */
-bool CLaserOdometry2DNode::setLaserPoseFromTf()
+bool CLaserOdometry2DNode::setLaserPoseFromTf(bool exact_capture)
 {
   geometry_msgs::msg::TransformStamped tf_laser;
 
@@ -191,6 +280,8 @@ bool CLaserOdometry2DNode::setLaserPoseFromTf()
   }
   catch (tf2::ExtrapolationException &)
   {
+    if (exact_capture)
+      return false;
     try
     {
       tf_laser = buffer_->lookupTransform(base_frame_id, last_scan.header.frame_id, tf2::TimePointZero);
@@ -208,6 +299,8 @@ bool CLaserOdometry2DNode::setLaserPoseFromTf()
   }
   catch (tf2::TransformException &ex)
   {
+    if (exact_capture)
+      return false;
     // Don't let a transient lookup failure overwrite the last known-good
     // extrinsic with a garbage/identity transform -- keep using it until
     // the next successful lookup. This matters once the laser->base_frame_id
@@ -271,7 +364,7 @@ void CLaserOdometry2DNode::warnOnSkippedScan()
  * the pose by wheel odometry's increment instead (or publishes nothing if
  * there is none) and every match's covariance follows its tier.
 */
-void CLaserOdometry2DNode::process()
+void CLaserOdometry2DNode::process(bool exact_capture)
 {
   if (!rf2o_ref.is_initialized())
     return;
@@ -279,7 +372,10 @@ void CLaserOdometry2DNode::process()
   // Refresh the laser->base_frame_id extrinsic every scan, not just once
   // at startup -- the sensor mount isn't assumed rigid (e.g. a
   // head-mounted lidar that pans independently of the base).
-  setLaserPoseFromTf();
+  if (!exact_capture)
+  {
+    setLaserPoseFromTf();
+  }
 
   // Replace the constant-velocity guess with measured motion, if any.
   has_odom_prior = !odom_prior_topic.empty() && setOdomPrior();
@@ -477,6 +573,14 @@ bool CLaserOdometry2DNode::odomPriorAt(double t, OdomSample &out) const
   return false;
 }
 
+bool CLaserOdometry2DNode::odomPriorBracketedAt(double t, OdomSample &out) const
+{
+  if (odom_prior_buf.empty() || t < odom_prior_buf.front().t ||
+      t > odom_prior_buf.back().t)
+    return false;
+  return odomPriorAt(t, out);
+}
+
 
 /**
  * Set rf2o's velocity prior to the odom motion between the last matched
@@ -592,6 +696,7 @@ void CLaserOdometry2DNode::publish(const Eigen::Matrix2d &position_cov)
 
   //publish the message
   odom_pub->publish(odom);
+  published_scan_stamp_ns = rclcpp::Time(odom.header.stamp).nanoseconds();
 
   // 2. publish over tf? (one one node should publish this transform!)
   if (publish_tf)
