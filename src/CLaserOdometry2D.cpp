@@ -67,6 +67,9 @@ void CLaserOdometry2D::init(const sensor_msgs::msg::LaserScan& scan,
   // Obtain laser parametes
   RCLCPP_INFO(get_logger(), "Got first Laser Scan .... Configuring node");
   width = scan.ranges.size();         // Num of samples (size) of the scan laser
+  scan_angle_min_ = scan.angle_min;
+  scan_angle_increment_ = scan.angle_increment;
+  scan_angle_max_ = scan.angle_max;
   cols = width;						            // Max resolution. Should be similar to the width parameter
   fovh = std::abs(scan.angle_max - scan.angle_min);  // Horizontal Laser's FOV
   ctf_levels = 5;                     // Coarse-to-Fine levels
@@ -193,6 +196,22 @@ const Pose3d& CLaserOdometry2D::getPose() const
 }
 
 
+bool CLaserOdometry2D::acceptsScanGeometry(const sensor_msgs::msg::LaserScan& scan)
+{
+  if (module_initialized && scan.ranges.size() == width &&
+      scan.angle_min == scan_angle_min_ &&
+      scan.angle_increment == scan_angle_increment_ && scan.angle_max == scan_angle_max_)
+    return true;
+
+  RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+    "Skipping scan: geometry differs from initialized grid "
+    "(size=%zu min=%.9g increment=%.9g max=%.9g; expected %u %.9g %.9g %.9g)",
+    scan.ranges.size(), scan.angle_min, scan.angle_increment, scan.angle_max,
+    module_initialized ? width : 0u, scan_angle_min_, scan_angle_increment_, scan_angle_max_);
+  return false;
+}
+
+
 /**
  * Performs multilevel odometry calculation from a pair of scan lasers (previous-current)
  * Odometry estimation in ROS is cumulative, that is, it adds incrementally to update the robot "odom"
@@ -205,6 +224,11 @@ bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& sc
   //=====================================
 
   quality_ = MatchQuality();
+  if (!acceptsScanGeometry(scan))
+  {
+    quality_.failure = MatchQuality::Failure::GEOMETRY;
+    return false;
+  }
 
   // copy @param scan to internal variable (we already did it for the previous scan)
   range_wf = Eigen::Map<const Eigen::MatrixXf>(scan.ranges.data(), width, 1);
@@ -349,6 +373,7 @@ const char* failureName(MatchQuality::Failure f)
     case MatchQuality::Failure::FEW_POINTS: return "few_points";
     case MatchQuality::Failure::EIGENSOLVER: return "eigensolver";
     case MatchQuality::Failure::IMPLAUSIBLE_SPEED: return "implausible_speed";
+    case MatchQuality::Failure::GEOMETRY: return "geometry";
   }
   return "unknown";
 }

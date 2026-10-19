@@ -145,6 +145,9 @@ void CLaserOdometry2DNode::LaserCallBack(const sensor_msgs::msg::LaserScan::Shar
 {
   if (GT_pose_initialized)
   {
+    if (rf2o_ref.is_initialized() && !rf2o_ref.acceptsScanGeometry(*new_scan))
+      return;
+
     last_scan = *new_scan;
     rf2o_ref.current_scan_time = last_scan.header.stamp;
 

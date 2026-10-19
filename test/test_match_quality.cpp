@@ -83,6 +83,49 @@ TEST_F(MatchQualityTest, StationaryFullScanIsClean)
   EXPECT_LT(q.speed, 0.05);
 }
 
+TEST_F(MatchQualityTest, VariableSizeScansAreSkippedWithoutChangingHistory)
+{
+  ASSERT_TRUE(match(roomScan(0.2)));
+  const Pose3d before = rf2o->getPose();
+  const auto history = rf2o->range;
+  const auto previous_time = rf2o->last_odom_time;
+  for (const size_t beams : {0u, 340u, 359u, 719u, 721u, 1440u})
+  {
+    auto scan = roomScan(0.3);
+    scan.ranges.resize(beams, 2.0f);
+    EXPECT_FALSE(match(scan)) << beams;
+    EXPECT_EQ(rf2o->getMatchQuality().failure, MatchQuality::Failure::GEOMETRY);
+    EXPECT_TRUE(rf2o->getPose().isApprox(before));
+    EXPECT_EQ(rf2o->last_odom_time, previous_time);
+    for (size_t i = 0; i < history.size(); ++i)
+      EXPECT_TRUE(rf2o->range[i].isApprox(history[i], 0.0f));
+  }
+  ASSERT_TRUE(match(roomScan(0.4)));
+  EXPECT_LT(rf2o->getMatchQuality().speed, 0.05);
+}
+
+TEST_F(MatchQualityTest, ChangedAnglesAreSkippedAndOriginalGridRecovers)
+{
+  ASSERT_TRUE(match(roomScan(0.2)));
+  const Pose3d before = rf2o->getPose();
+  const auto previous_time = rf2o->last_odom_time;
+  for (int field = 0; field < 3; ++field)
+  {
+    auto scan = roomScan(0.3);
+    float* angle = field == 0 ? &scan.angle_min :
+      field == 1 ? &scan.angle_increment : &scan.angle_max;
+    *angle += 0.001f;
+    EXPECT_FALSE(match(scan));
+    EXPECT_EQ(rf2o->getMatchQuality().failure, MatchQuality::Failure::GEOMETRY);
+    *angle = std::numeric_limits<float>::quiet_NaN();
+    EXPECT_FALSE(match(scan));
+    EXPECT_TRUE(rf2o->getPose().isApprox(before));
+    EXPECT_EQ(rf2o->last_odom_time, previous_time);
+  }
+  ASSERT_TRUE(match(roomScan(0.4)));
+  EXPECT_LT(rf2o->getMatchQuality().speed, 0.05);
+}
+
 TEST_F(MatchQualityTest, BlankScanFailsInsteadOfReadingStopped)
 {
   const Pose3d before = rf2o->getPose();

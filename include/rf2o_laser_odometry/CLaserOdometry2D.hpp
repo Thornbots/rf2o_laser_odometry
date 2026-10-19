@@ -73,7 +73,7 @@ using IncrementCov = Eigen::Matrix<Scalar, 3, 3>;
 // evidence only. Filled on every call, success or not.
 struct MatchQuality
 {
-  enum class Failure { NONE, NO_LEVELS, FEW_POINTS, EIGENSOLVER, IMPLAUSIBLE_SPEED };
+  enum class Failure { NONE, NO_LEVELS, FEW_POINTS, EIGENSOLVER, IMPLAUSIBLE_SPEED, GEOMETRY };
   Failure failure = Failure::NONE;
   unsigned int levels_solved = 0;
   bool finest_level_solved = false;
@@ -98,6 +98,9 @@ public:
             const geometry_msgs::msg::Pose& initial_robot_pose);
 
   bool is_initialized();
+
+  // Reject changes to the initialized angular grid before touching matcher state.
+  bool acceptsScanGeometry(const sensor_msgs::msg::LaserScan& scan);
 
   bool odometryCalculation(const sensor_msgs::msg::LaserScan& scan);
 
@@ -160,6 +163,9 @@ public:
   unsigned int cols;
   unsigned int cols_i;
   unsigned int width;
+  float scan_angle_min_ = 0.0f;
+  float scan_angle_increment_ = 0.0f;
+  float scan_angle_max_ = 0.0f;
   unsigned int ctf_levels;
   unsigned int image_level, level;
   unsigned int num_valid_range;
