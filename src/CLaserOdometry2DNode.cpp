@@ -284,6 +284,17 @@ void CLaserOdometry2DNode::process()
   // head-mounted lidar that pans independently of the base).
   setLaserPoseFromTf();
 
+  // A stale extrinsic hides how far a panning head turned, and matching or
+  // seeding across that swing reads it as translation. Skip the scan like a
+  // dropped one: the next fresh scan matches across the gap.
+  if (extrinsic_stale && confidence_enabled)
+  {
+    last_scan_stamp = rf2o_ref.last_odom_time;
+    publishQuality(Tier::FAILED, "extrinsic_stale", MatchQuality(),
+                   Eigen::Vector2d::Zero(), "none");
+    return;
+  }
+
   // Replace the constant-velocity guess with measured motion, if any.
   has_odom_prior = !odom_prior_topic.empty() && setOdomPrior();
 
@@ -341,7 +352,7 @@ void CLaserOdometry2DNode::process()
           double(q.valid_points) / q.points < min_valid_fraction;
       for (int i = 0; i < 2; i++)
       {
-        if (few_points || !q.finest_level_solved || extrinsic_stale ||
+        if (few_points || !q.finest_level_solved ||
             sigma(i) > max_match_sigma || last_gap_periods > 1.5)
           extra_laser += degraded_position_variance *
               eig.eigenvectors().col(i) * eig.eigenvectors().col(i).transpose();
@@ -483,7 +494,8 @@ bool CLaserOdometry2DNode::odomPriorAt(double t, OdomSample &out) const
 
 /**
  * Set rf2o's velocity prior to the odom motion between the last matched
- * scan and this one, as a per-scan increment in the previous laser frame.
+ * scan and this one, as a per-scan increment in the previous laser frame,
+ * including the head's swing between the two scans' extrinsics.
  * Leaves the constant-velocity prior in place if odom doesn't cover both.
  */
 bool CLaserOdometry2DNode::setOdomPrior()
@@ -509,8 +521,7 @@ bool CLaserOdometry2DNode::setOdomPrior()
   robot_inc.linear() = rf2o::matrixYaw(std::remainder(p1.yaw - p0.yaw, 2.0 * M_PI));
   robot_inc.translation() << c * dx + s * dy, -s * dx + c * dy, 0.0;
   odom_prior_increment = robot_inc;
-  const Pose3d laser_inc =
-    rf2o_ref.laser_pose_on_robot_inv_ * robot_inc * rf2o_ref.laser_pose_on_robot_;
+  const Pose3d laser_inc = rf2o_ref.laserIncrement(robot_inc);
 
   rf2o_ref.kai_loc_old_(0) = laser_inc.translation()(0);
   rf2o_ref.kai_loc_old_(1) = laser_inc.translation()(1);

@@ -106,6 +106,10 @@ public:
 
   void setLaserPose(const Pose3d& laser_pose);
 
+  // Laser motion since laser_pose_ for a robot increment, across any
+  // extrinsic change (a panning head) since that pose was built.
+  Pose3d laserIncrement(const Pose3d& robot_increment) const;
+
   const Pose3d& getIncrement() const;
 
   const IncrementCov& getIncrementCovariance() const;
@@ -184,6 +188,7 @@ public:
   Pose3d last_increment_;
   Pose3d laser_pose_on_robot_;
   Pose3d laser_pose_on_robot_inv_;
+  Pose3d laser_pose_on_robot_prev_;  // extrinsic laser_pose_ was built with
   Pose3d laser_pose_;
   Pose3d laser_oldpose_;
   Pose3d robot_pose_;
