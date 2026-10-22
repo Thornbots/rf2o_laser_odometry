@@ -43,6 +43,25 @@ sensor_msgs::msg::LaserScan roomScan(double t, double keep_fraction = 1.0)
   return s;
 }
 
+// roomScan() seen from a lidar at (x, y), turned by yaw, in the room's frame.
+sensor_msgs::msg::LaserScan roomScanFrom(double t, double x, double y, double yaw)
+{
+  auto s = roomScan(t);
+  uint32_t seed = static_cast<uint32_t>(t * 1000) + 1;
+  for (int i = 0; i < kBeams; i++)
+  {
+    seed = seed * 1664525u + 1013904223u;
+    const double noise = 0.005 * (2.0 * (seed >> 8) / static_cast<double>(1u << 24) - 1.0);
+    const double a = s.angle_min + i * s.angle_increment + yaw;
+    const double c = std::cos(a), sn = std::sin(a);
+    double r = std::numeric_limits<double>::infinity();
+    if (std::abs(c) > 1e-9) r = std::min(r, ((c > 0 ? kHalfSide : -kHalfSide) - x) / c);
+    if (std::abs(sn) > 1e-9) r = std::min(r, ((sn > 0 ? kHalfSide : -kHalfSide) - y) / sn);
+    s.ranges[i] = static_cast<float>(r + noise);
+  }
+  return s;
+}
+
 // The sentry's RPLIDAR A2M8 scan as the driver publishes it with
 // angle_compensate:=true (2026-10-18 robot capture): 720 beams from -pi to +pi
 // inclusive (increment 2pi/719), range_min 0.05, ~40% scattered no-returns
@@ -193,6 +212,50 @@ TEST_F(MatchQualityTest, DeadReckonMovesTheRobotByTheIncrement)
   EXPECT_NEAR(moved.x(), 0.3, 1e-4);
   EXPECT_NEAR(moved.y(), 0.1, 1e-4);
   EXPECT_EQ(rf2o->last_odom_time, rf2o->current_scan_time);
+}
+
+// A head-mounted lidar swings about the robot's z axis without the robot
+// moving: rotate the fixture's extrinsic about the robot origin.
+Pose3d swungExtrinsic(const Pose3d &extrinsic, double swing)
+{
+  Pose3d turn = Pose3d::Identity();
+  turn.linear() = rf2o::matrixYaw(swing);
+  return turn * extrinsic;
+}
+
+TEST_F(MatchQualityTest, DeadReckonCarriesAHeadSwing)
+{
+  rf2o->fixed_heading = true;
+  const Pose3d before = rf2o->getPose();
+  rf2o->setLaserPose(swungExtrinsic(rf2o->laser_pose_on_robot_, 0.3));
+  Pose3d inc = Pose3d::Identity();
+  inc.translation() << 0.3, 0.1, 0.0;
+  rf2o->current_scan_time = rclcpp::Time(int64_t{200000000}, RCL_ROS_TIME);
+  rf2o->deadReckon(inc);
+  const Eigen::Vector3d moved = rf2o->getPose().translation() - before.translation();
+  EXPECT_NEAR(moved.x(), 0.3, 1e-4);
+  EXPECT_NEAR(moved.y(), 0.1, 1e-4);
+}
+
+// Seeded as the node's odom prior seeds a parked robot, a fast head swing
+// (0.3 rad in one scan) must not read as speed or move the robot.
+TEST_F(MatchQualityTest, SeededHeadSwingIsNeitherSpeedNorMotion)
+{
+  rf2o->fixed_heading = true;
+  const Pose3d before = rf2o->getPose();
+  // The fixture's scans put the lidar at the room centre, facing +x.
+  const Pose3d extrinsic = rf2o->laser_pose_on_robot_;
+  const Pose3d swung = swungExtrinsic(extrinsic, 0.3);
+  const Pose3d lidar = extrinsic.inverse() * swung;
+  rf2o->setLaserPose(swung);
+  const Pose3d seed = rf2o->laserIncrement(Pose3d::Identity());
+  rf2o->kai_loc_old_ << seed.translation().x(), seed.translation().y(),
+      rf2o::getYaw(seed.rotation());
+  ASSERT_TRUE(match(roomScanFrom(0.2, lidar.translation().x(), lidar.translation().y(),
+                                 rf2o::getYaw(lidar.rotation()))));
+  EXPECT_LT(rf2o->getMatchQuality().speed, 0.05);
+  const Eigen::Vector3d moved = rf2o->getPose().translation() - before.translation();
+  EXPECT_LT(moved.head<2>().norm(), 0.005) << moved.transpose();
 }
 
 TEST(RealFormatScan, InitializesAndMatchesTranslation)

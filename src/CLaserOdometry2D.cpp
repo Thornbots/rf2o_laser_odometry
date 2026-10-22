@@ -31,6 +31,7 @@ CLaserOdometry2D::CLaserOdometry2D() :
   last_increment_(Pose3d::Identity()),
   laser_pose_on_robot_(Pose3d::Identity()),
   laser_pose_on_robot_inv_(Pose3d::Identity()),
+  laser_pose_on_robot_prev_(Pose3d::Identity()),
   laser_pose_(Pose3d::Identity()),
   laser_oldpose_(Pose3d::Identity()),
   robot_pose_(Pose3d::Identity()),
@@ -48,6 +49,12 @@ void CLaserOdometry2D::setLaserPose(const Pose3d& laser_pose)
 {
   laser_pose_on_robot_     = laser_pose;
   laser_pose_on_robot_inv_ = laser_pose_on_robot_.inverse();
+}
+
+
+Pose3d CLaserOdometry2D::laserIncrement(const Pose3d& robot_increment) const
+{
+  return laser_pose_on_robot_prev_.inverse() * robot_increment * laser_pose_on_robot_;
 }
 
 
@@ -89,6 +96,7 @@ void CLaserOdometry2D::init(const sensor_msgs::msg::LaserScan& scan,
 
   // Get the initial laser pose assuming laser is fixed with respect the base_link
   laser_pose_    = robot_initial_pose * laser_pose_on_robot_;
+  laser_pose_on_robot_prev_ = laser_pose_on_robot_;
   robot_initial_pose_ = robot_initial_pose;
   laser_oldpose_ = laser_oldpose_;
 
@@ -329,9 +337,11 @@ bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& sc
   const double time_inc_sec = (current_scan_time - last_odom_time).seconds();
   if (time_inc_sec > 0.0)
   {
+    // The full laser motion, so a panning head's own swing isn't speed.
     Pose3d laser_inc = Pose3d::Identity();
+    laser_inc = rf2o::matrixYaw(static_cast<double>(std::atan2(acu_trans(1,0), acu_trans(0,0))));
     laser_inc.translation() << acu_trans(0,2), acu_trans(1,2), 0.0;
-    const Pose3d robot_inc = laser_pose_on_robot_ * laser_inc * laser_pose_on_robot_inv_;
+    const Pose3d robot_inc = laser_pose_on_robot_prev_ * laser_inc * laser_pose_on_robot_inv_;
     quality_.speed = robot_inc.translation().head<2>().norm() / time_inc_sec;
     if (max_speed > 0.0 && quality_.speed > max_speed)
     {
@@ -354,7 +364,7 @@ bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& sc
 
 void CLaserOdometry2D::deadReckon(const Pose3d& robot_increment)
 {
-  const Pose3d laser_inc = laser_pose_on_robot_inv_ * robot_increment * laser_pose_on_robot_;
+  const Pose3d laser_inc = laserIncrement(robot_increment);
   const float yaw = rf2o::getYaw(laser_inc.rotation());
   Eigen::Matrix3f acu_trans;
   acu_trans << std::cos(yaw), -std::sin(yaw), laser_inc.translation()(0),
@@ -1058,6 +1068,7 @@ void CLaserOdometry2D::PoseUpdate(const Eigen::Matrix3f& acu_trans)
   }
 
   last_increment_ = pose_aux_2D;
+  laser_pose_on_robot_prev_ = laser_pose_on_robot_;
 
   //				Compute kai_loc_old
   //-------------------------------------------------------
