@@ -20,15 +20,19 @@ be selected after the deadline even following a scan interruption. References dr
 once rf2o's pose is `reference_max_offset` from where they were taken, and
 all drop on a degraded or failed match. Odom only picks the reference: the match still
 measures any motion from it, so a shove with the wheels held shows up.
-Anchored increments below 8 mm average the new match and previous accepted
-position equally to suppress angular rebinning and transient occlusion noise.
+Anchored raw increments below the tuned 8 mm threshold average the new match
+and previous published position with the tuned equal (0.5) weights to suppress angular rebinning and transient occlusion noise.
 This adds one scan of lag at low constant speed; larger shoves retain their
-full increment. It does not freeze wheel-slip motion.
-Reference tolerances must be finite and positive. The old bank controls
-`reference_max_scans` and `reference_max_yaw` remain accepted and validated
-for configuration compatibility; a park now uses one anchor at every angle.
-Match speed limits and published robot-frame x/y/yaw twist use
-consecutive accepted robot poses and scan stamps, independently of anchor age.
+full increment. Only published pose and twist are smoothed; raw robot/laser
+poses seed the chain and each new anchor, so reanchoring cannot accumulate
+this lag. Anchored range warping uses linear interpolation weights to avoid
+the short-translation bias of upstream squared weights. Consecutive-scan
+warping retains its existing weights. It does not freeze wheel-slip motion.
+Reference tolerances must be finite and positive. A park uses one anchor at
+every angle; creation and refresh require an exact stamped extrinsic.
+Match speed limits use consecutive raw accepted robot poses. Published
+robot-frame x/y/yaw twist uses consecutive output poses and scan stamps,
+independently of anchor age.
 
 Estimation of 2D odometry based on planar laser scans. rf2o is a fast and precise method to estimate the planar motion of a lidar from consecutive range scans. Useful for mobile robots with inaccurate wheel odometry.
 
@@ -59,7 +63,11 @@ Odometry endpoints are never held beyond their stamps. The previous matched
 odometry pose is retained for fallback across a dropped-scan gap. Duplicate
 and slightly reordered scan/odometry stamps are ignored. A backward jump over
 1 s resets scan/odometry history and parked references, logs a warning, and
-initializes again at the new scan time. Invalid solves and covariances fail
+initializes at the new scan time from the last accepted rf2o pose. The topic
+origin is used only for first initialization. During recovery, stamps more
+than 1 s ahead of clock progress from the reset are discarded until the
+retired epoch has elapsed, preventing delayed old messages from resetting
+the pose history again. Invalid solves and covariances fail
 before updating the pose.
 
 Initialization builds the first scan's pyramid. If a later match fails and

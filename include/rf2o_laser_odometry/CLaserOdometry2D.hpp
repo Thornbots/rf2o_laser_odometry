@@ -212,6 +212,7 @@ public:
   Pose3d laser_pose_;
   Pose3d laser_oldpose_;
   Pose3d robot_pose_;
+  Pose3d published_robot_pose_ = Pose3d::Identity();  // output only; never an anchor
   Pose3d robot_oldpose_;
   Pose3d robot_initial_pose_;
 

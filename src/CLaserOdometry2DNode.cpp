@@ -92,23 +92,15 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(const rclcpp::NodeOptions &options)
   this->get_parameter("reference_scans", reference_scans);
   this->declare_parameter<double>("reference_max_offset", 0.02);
   this->get_parameter("reference_max_offset", reference_max_offset);
-  this->declare_parameter<double>("reference_max_yaw", 0.035);
-  this->get_parameter("reference_max_yaw", reference_max_yaw);
   this->declare_parameter<double>("reference_still_distance", 0.005);
   this->get_parameter("reference_still_distance", reference_still_distance);
   this->declare_parameter<double>("reference_still_time", 2.0);
   this->get_parameter("reference_still_time", reference_still_time);
   reference_max_age = declare_parameter<double>("reference_max_age", 7.5);
-  // Legacy bank controls remain accepted for #17 configuration compatibility.
-  // A park now has one anchor, regardless of its head angle.
-  this->declare_parameter<int>("reference_max_scans", 128);
-  this->get_parameter("reference_max_scans", reference_max_scans);
-  for (double tolerance : {reference_max_offset, reference_max_yaw,
+  for (double tolerance : {reference_max_offset,
                            reference_still_distance, reference_still_time, reference_max_age})
     if (!std::isfinite(tolerance) || tolerance <= 0.0)
       throw std::invalid_argument("reference tolerances must be finite and positive");
-  if (reference_max_scans <= 0 || reference_max_scans > 4096)
-    throw std::invalid_argument("reference_max_scans must be in [1, 4096]");
   // Only an applied check may reject a match inside rf2o; otherwise the
   // quality topic reports what would have happened.
   if (confidence_enabled)
@@ -171,8 +163,10 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(const rclcpp::NodeOptions &options)
 void CLaserOdometry2DNode::LaserCallBack(const sensor_msgs::msg::LaserScan::SharedPtr new_scan)
 {
   const int64_t stamp = rclcpp::Time(new_scan->header.stamp).nanoseconds();
+  if (retiredClockStamp(stamp * 1e-9))
+    return;
   if (newest_scan_stamp - stamp > 1000000000LL)
-    resetClockHistory();
+    resetClockHistory(stamp * 1e-9);
   if (stamp <= newest_scan_stamp ||
       (rf2o_ref.is_initialized() && !rf2o_ref.acceptsScanGeometry(*new_scan)))
     return;
@@ -191,9 +185,28 @@ void CLaserOdometry2DNode::LaserCallBack(const sensor_msgs::msg::LaserScan::Shar
 }
 
 
-void CLaserOdometry2DNode::resetClockHistory()
+bool CLaserOdometry2DNode::retiredClockStamp(double stamp)
+{
+  // During a rewind, delayed messages from the old epoch can look like a
+  // forward jump, followed by another rewind. Bound new stamps by clock
+  // progress from the reset, with the same 1 s tolerance as reset detection.
+  if (reset_stamp < 0.0)
+    return false;
+  const auto now = get_clock()->now();
+  reset_clock_time = std::min(reset_clock_time, now);
+  const double elapsed = (now - reset_clock_time).seconds();
+  return reset_stamp + elapsed < retired_epoch_end &&
+      stamp > reset_stamp + elapsed + 1.0;
+}
+
+
+void CLaserOdometry2DNode::resetClockHistory(double stamp)
 {
   RCLCPP_WARN(get_logger(), "Clock jumped backwards by more than 1 s; resetting scan and odometry history");
+  retired_epoch_end = std::max({retired_epoch_end, newest_scan_stamp * 1e-9,
+      odom_prior_buf.empty() ? -1.0 : odom_prior_buf.back().t});
+  reset_stamp = stamp;
+  reset_clock_time = get_clock()->now();
   odom_prior_buf.clear();
   buffer_->clear();
   pending_scans.clear();
@@ -264,8 +277,16 @@ void CLaserOdometry2DNode::drainPendingScans()
     if (rf2o_ref.first_laser_scan)
     {
       auto pose = initial_robot_pose.pose.pose;
-      // A distinct init topic remains an explicitly supplied origin.
-      if (initPose_sub && odom_prior_sub &&
+      // Topic origins seed only the first initialization; rewinds keep odom continuous.
+      if (pose_initialized_once)
+      {
+        pose.position.x = rf2o_ref.robot_pose_.translation().x();
+        pose.position.y = rf2o_ref.robot_pose_.translation().y();
+        tf2::Quaternion yaw;
+        yaw.setRPY(0.0, 0.0, rf2o::getYaw(rf2o_ref.robot_pose_.rotation()));
+        pose.orientation = tf2::toMsg(yaw);
+      }
+      else if (initPose_sub && odom_prior_sub &&
           std::string(initPose_sub->get_topic_name()) == odom_prior_sub->get_topic_name())
       {
         pose.position.x = prior.x;
@@ -276,6 +297,7 @@ void CLaserOdometry2DNode::drainPendingScans()
       }
       rf2o_ref.init(last_scan, pose);
       rf2o_ref.first_laser_scan = false;
+      pose_initialized_once = true;
       last_scan_stamp = scan->header.stamp;
       RCLCPP_INFO(get_logger(), "Initialized at scan %.9f: x=%.6f y=%.6f",
                   stamp, pose.position.x, pose.position.y);
@@ -566,10 +588,12 @@ void CLaserOdometry2DNode::odomPriorCallBack(const nav_msgs::msg::Odometry::Shar
   if (!std::isfinite(s.t) || !std::isfinite(s.x) ||
       !std::isfinite(s.y) || !std::isfinite(s.yaw))
     return;
+  if (retiredClockStamp(s.t))
+    return;
   if (!odom_prior_buf.empty())
   {
     if (odom_prior_buf.back().t - s.t > 1.0)
-      resetClockHistory();
+      resetClockHistory(s.t);
   }
   if (!odom_prior_buf.empty())
   {
@@ -735,7 +759,8 @@ void CLaserOdometry2DNode::updateReferences(Tier tier, const Reference *used)
   const double t = rf2o_ref.current_scan_time.seconds();
   // Refresh while still anchored; an interruption past the deadline cannot
   // use an expired scan to publish one last biased pose.
-  const bool refresh = used && t - used->scan.stamp.seconds() >= 0.9 * reference_max_age;
+  const bool refresh = extrinsic_age == 0.0 && used &&
+      t - used->scan.stamp.seconds() >= 0.9 * reference_max_age;
   references.erase(std::remove_if(references.begin(), references.end(),
       [&](const Reference &r) {
         return (refresh && &r == used) || t - r.scan.stamp.seconds() >= reference_max_age ||
@@ -743,7 +768,7 @@ void CLaserOdometry2DNode::updateReferences(Tier tier, const Reference *used)
       }),
       references.end());
   OdomSample odom;
-  if (references.empty() && parked() &&
+  if (extrinsic_age == 0.0 && references.empty() && parked() &&
       odomPriorAt(rf2o_ref.current_scan_time.seconds(), odom))
   {
     references.push_back(Reference{rf2o_ref.currentReference(), odom, xy});
@@ -785,7 +810,7 @@ void CLaserOdometry2DNode::publish(const Eigen::Matrix2d &position_cov)
   // 1. publish odom as a topic (no harm!)
   RCLCPP_DEBUG(get_logger(), "Publishing odom over topic:[%s]", odom_topic.c_str());
   tf2::Quaternion tf_quaternion;
-  tf_quaternion.setRPY(0.0, 0.0, rf2o::getYaw(rf2o_ref.robot_pose_.rotation()));
+  tf_quaternion.setRPY(0.0, 0.0, rf2o::getYaw(rf2o_ref.published_robot_pose_.rotation()));
   geometry_msgs::msg::Quaternion quaternion = tf2::toMsg(tf_quaternion);
   
   // compose odom msg
@@ -793,8 +818,8 @@ void CLaserOdometry2DNode::publish(const Eigen::Matrix2d &position_cov)
   odom.header.stamp = rf2o_ref.last_odom_time;    // the time of the last scan used!
   odom.header.frame_id = odom_frame_id;
   //set the position
-  odom.pose.pose.position.x = rf2o_ref.robot_pose_.translation()(0);
-  odom.pose.pose.position.y = rf2o_ref.robot_pose_.translation()(1);
+  odom.pose.pose.position.x = rf2o_ref.published_robot_pose_.translation()(0);
+  odom.pose.pose.position.y = rf2o_ref.published_robot_pose_.translation()(1);
   odom.pose.pose.position.z = 0.0;
   odom.pose.pose.orientation = quaternion;
   //set the velocity
@@ -845,8 +870,8 @@ void CLaserOdometry2DNode::publish(const Eigen::Matrix2d &position_cov)
     odom_trans.header.stamp = rf2o_ref.last_odom_time;    // the time of the last scan used!
     odom_trans.header.frame_id = odom_frame_id;
     odom_trans.child_frame_id = base_frame_id;
-    odom_trans.transform.translation.x = rf2o_ref.robot_pose_.translation()(0);
-    odom_trans.transform.translation.y = rf2o_ref.robot_pose_.translation()(1);
+    odom_trans.transform.translation.x = rf2o_ref.published_robot_pose_.translation()(0);
+    odom_trans.transform.translation.y = rf2o_ref.published_robot_pose_.translation()(1);
     odom_trans.transform.translation.z = 0.0;
     odom_trans.transform.rotation = quaternion;
     //send the transform
