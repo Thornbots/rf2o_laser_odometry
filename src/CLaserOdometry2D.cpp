@@ -1116,12 +1116,20 @@ bool CLaserOdometry2D::filterLevelSolution()
   for (unsigned int i=0; i<level; i++)
     acu_trans = transformations[i]*acu_trans;
 
-  kai_loc_sub(0) = -fps*acu_trans(0,2);
-  kai_loc_sub(1) = -fps*acu_trans(1,2);
-  kai_loc_sub(2) = -fps*std::atan2(acu_trans(1,0), acu_trans(0,0));
-  kai_loc_sub += kai_loc_old_;
   if (reference_)
-    kai_loc_sub(2) = std::remainder(kai_loc_sub(2), 2.f * static_cast<float>(M_PI));
+  {
+    // Corrections multiply on the left: the remaining prior is P * A^-1.
+    const Eigen::Matrix3f residual = initial_warp_ * acu_trans.inverse();
+    kai_loc_sub << fps * residual(0, 2), fps * residual(1, 2),
+        fps * std::atan2(residual(1, 0), residual(0, 0));
+  }
+  else
+  {
+    kai_loc_sub(0) = -fps*acu_trans(0,2);
+    kai_loc_sub(1) = -fps*acu_trans(1,2);
+    kai_loc_sub(2) = -fps*std::atan2(acu_trans(1,0), acu_trans(0,0));
+    kai_loc_sub += kai_loc_old_;
+  }
   if (!acu_trans.allFinite() || !kai_loc_sub.allFinite())
     return false;
 
