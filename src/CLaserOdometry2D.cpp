@@ -117,6 +117,7 @@ void CLaserOdometry2D::init(const sensor_msgs::msg::LaserScan& scan,
   robot_initial_pose_ = robot_initial_pose;
   robot_pose_ = robot_initial_pose;
   robot_oldpose_ = robot_initial_pose;
+  published_robot_pose_ = robot_initial_pose;
   lin_speed = 0.0;
   ang_speed = 0.0;
   laser_oldpose_ = laser_pose_;
@@ -1046,11 +1047,13 @@ void CLaserOdometry2D::performWarping()
         }
         else
         {
-          const float w_r = delta_l*delta_l;
+          // Anchored subpixel motion needs linear interpolation; squared
+          // weights bias repeated short translations before reanchoring.
+          const float w_r = reference_ ? delta_l : delta_l*delta_l;
           range_warped[image_level](uwarp_r) += w_r*range_w;
           wacu(uwarp_r) += w_r;
 
-          const float w_l = delta_r*delta_r;
+          const float w_l = reference_ ? delta_r : delta_r*delta_r;
           range_warped[image_level](uwarp_l) += w_l*range_w;
           wacu(uwarp_l) += w_l;
         }
@@ -1239,23 +1242,27 @@ void CLaserOdometry2D::PoseUpdate(const Eigen::Matrix3f& acu_trans)
 
   // Compose Transformations (robot odom)
   robot_pose_ = laser_pose_ * laser_pose_on_robot_inv_;
-  if (reference_ && (robot_pose_.translation() - robot_oldpose_.translation()).head<2>().norm() < 0.008)
-  {
-    // Half-weight the anchored position to suppress rebinning/occlusion noise.
-    // Below 8 mm: one-scan lag. Larger shoves retain their full increment.
-    robot_pose_.translation() = 0.5 * (robot_pose_.translation() + robot_oldpose_.translation());
-    laser_pose_ = robot_pose_ * laser_pose_on_robot_;
-  }
+  const Pose3d previous_output = published_robot_pose_;
+  published_robot_pose_ = robot_pose_;
+  // Tuned for parked-head rebinning/occlusion noise: 8 mm threshold and
+  // equal weights give one scan of output lag at low constant speed.
+  // Raw poses must seed the chain and anchors without this lag.
+  constexpr double small_increment_m = 0.008;
+  constexpr double output_weight = 0.5;
+  if (reference_ && (robot_pose_.translation() - robot_oldpose_.translation()).head<2>().norm() <
+      small_increment_m)
+    published_robot_pose_.translation() = output_weight * robot_pose_.translation() +
+        (1.0 - output_weight) * previous_output.translation();
 
   RCLCPP_DEBUG(get_logger(), "Robot-base odom [x,y,yaw]=[%f %f %f]",
                 robot_pose_.translation()(0),
                 robot_pose_.translation()(1),
                 rf2o::getYaw(robot_pose_.rotation()));
 
-  // Twist spans consecutive accepted robot poses, regardless of the scan anchor.
+  // Twist spans consecutive published poses, regardless of the scan anchor.
   const double time_inc_sec = (current_scan_time - last_odom_time).seconds();
-  const Eigen::Vector3d velocity = robot_pose_.linear().transpose() *
-      (robot_pose_.translation() - robot_oldpose_.translation()) / time_inc_sec;
+  const Eigen::Vector3d velocity = published_robot_pose_.linear().transpose() *
+      (published_robot_pose_.translation() - previous_output.translation()) / time_inc_sec;
   lin_speed = velocity.x();
   lat_speed = velocity.y();
   ang_speed = std::remainder(rf2o::getYaw(robot_pose_.rotation()) -
