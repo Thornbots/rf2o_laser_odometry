@@ -425,6 +425,140 @@ TEST_F(MatchQualityTest, SeededHeadSwingIsNeitherSpeedNorMotion)
   EXPECT_LT(moved.head<2>().norm(), 0.005) << moved.transpose();
 }
 
+// Matched against one reference, a parked lidar's pose is that match's
+// error alone; it does not integrate scan to scan.
+TEST_F(MatchQualityTest, StationaryScansAgainstAReferenceStayPut)
+{
+  ASSERT_TRUE(match(roomScan(0.2)));
+  const rf2o::ReferenceScan ref = rf2o->currentReference();
+  for (int i = 3; i < 200; i++)
+  {
+    const auto scan = roomScan(0.1 * i);
+    rf2o->current_scan_time = scan.header.stamp;
+    ASSERT_TRUE(rf2o->odometryCalculation(scan, &ref)) << i;
+    const Eigen::Vector3d off = rf2o->getPose().translation() -
+      (ref.laser_pose * ref.laser_pose_on_robot.inverse()).translation();
+    EXPECT_LT(off.head<2>().norm(), 0.002) << i;
+  }
+  EXPECT_EQ(rf2o->last_odom_time, rclcpp::Time(int64_t{19900000000}, RCL_ROS_TIME));
+}
+
+// Moved since the reference, the match measures the whole move from it.
+TEST_F(MatchQualityTest, ReferenceMatchMeasuresFromTheReference)
+{
+  const rf2o::ReferenceScan ref = rf2o->currentReference();
+  ASSERT_TRUE(match(roomScanFrom(0.2, 0.01, 0.0, 0.0)));
+  const auto scan = roomScanFrom(0.3, 0.03, 0.0, 0.0);
+  rf2o->current_scan_time = scan.header.stamp;
+  ASSERT_TRUE(rf2o->odometryCalculation(scan, &ref));
+  const Eigen::Vector3d moved = rf2o->getPose().translation() -
+      (ref.laser_pose * ref.laser_pose_on_robot.inverse()).translation();
+  EXPECT_NEAR(moved.head<2>().norm(), 0.03, 0.005) << moved.transpose();
+}
+
+// The constant-velocity prior a scan without odom falls back on stays one
+// scan's motion after a match that spans two scans from its reference.
+TEST_F(MatchQualityTest, ReferenceMatchLeavesAPerScanPrior)
+{
+  const rf2o::ReferenceScan ref = rf2o->currentReference();
+  ASSERT_TRUE(match(roomScanFrom(0.2, 0.01, 0.0, 0.0)));
+  const auto scan = roomScanFrom(0.3, 0.02, 0.0, 0.0);
+  rf2o->current_scan_time = scan.header.stamp;
+  ASSERT_TRUE(rf2o->odometryCalculation(scan, &ref));
+  EXPECT_NEAR(rf2o->kai_loc_old_.head<2>().norm(), 0.01, 0.004)
+      << rf2o->kai_loc_old_.transpose();
+}
+
+TEST_F(MatchQualityTest, FailedReferenceMatchKeepsThePreviousScansPose)
+{
+  ASSERT_TRUE(match(roomScan(0.2)));
+  const rf2o::ReferenceScan ref = rf2o->currentReference();
+  ASSERT_TRUE(match(roomScanFrom(0.3, 0.02, 0.0, 0.0)));
+  const Pose3d before = rf2o->getPose();
+  const auto previous_time = rf2o->last_odom_time;
+  const auto blank = roomScan(0.4, 0.0);
+  rf2o->current_scan_time = blank.header.stamp;
+  EXPECT_FALSE(rf2o->odometryCalculation(blank, &ref));
+  EXPECT_TRUE(rf2o->getPose().isApprox(before));
+  EXPECT_EQ(rf2o->last_odom_time, previous_time);
+}
+
+TEST_F(MatchQualityTest, FailedAnchorDiscardsToConsecutiveReference)
+{
+  const auto anchor = rf2o->currentReference();
+  ASSERT_TRUE(match(roomScanFrom(0.2, 0.02, 0.0, 0.0)));
+  const auto accepted = rf2o->currentReference();
+  rf2o->setLaserPose(swungExtrinsic(accepted.laser_pose_on_robot, 0.1));
+  EXPECT_FALSE(rf2o->odometryCalculation(roomScan(0.3, 0.0), &anchor));
+  Pose3d invalid = Pose3d::Identity();
+  invalid.translation().x() = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(rf2o->deadReckon(invalid));
+  rf2o->discardScan();
+  EXPECT_EQ(rf2o->last_odom_time, accepted.stamp);
+  EXPECT_TRUE(rf2o->laser_pose_.isApprox(accepted.laser_pose));
+  EXPECT_TRUE(rf2o->laser_pose_on_robot_.isApprox(accepted.laser_pose_on_robot));
+  for (size_t i = 0; i < accepted.range.size(); ++i)
+  {
+    EXPECT_TRUE(rf2o->range[i].isApprox(accepted.range[i], 0.f));
+    EXPECT_TRUE(rf2o->xx[i].isApprox(accepted.xx[i], 0.f));
+    EXPECT_TRUE(rf2o->yy[i].isApprox(accepted.yy[i], 0.f));
+  }
+  const auto head = swungExtrinsic(accepted.laser_pose_on_robot, 0.15);
+  Pose3d motion = Pose3d::Identity();
+  motion.translation() << 0.02, 0.01, 0.0;
+  const auto lidar = accepted.laser_pose_on_robot.inverse() * motion * head;
+  rf2o->setLaserPose(head);
+  const auto base_scan = roomScanFrom(0.4, 0.02 + lidar.translation().x(),
+      lidar.translation().y(), rf2o::getYaw(lidar.rotation()));
+  ASSERT_TRUE(match(base_scan));
+  EXPECT_TRUE(rf2o->laser_pose_on_robot_prev_.isApprox(head));
+  const Pose3d expected = accepted.laser_pose * accepted.laser_pose_on_robot.inverse() * motion;
+  EXPECT_LT((rf2o->robot_pose_.translation() - expected.translation()).head<2>().norm(), 0.01);
+  EXPECT_FALSE(rf2o->odometryCalculation(roomScan(0.3), &anchor));
+  EXPECT_EQ(rf2o->getMatchQuality().failure, MatchQuality::Failure::TIMESTAMP);
+}
+
+TEST_F(MatchQualityTest, OldAnchorCannotDiluteSuddenFalseAlignmentSpeed)
+{
+  auto anchor = rf2o->currentReference();
+  ASSERT_TRUE(match(roomScan(60.0)));
+  const auto accepted = rf2o->currentReference();
+  // An aliased object gives a perfect local alignment at a false world pose.
+  anchor.laser_pose.translation().x() += 0.8;
+  rf2o->max_speed = 6.0;
+  EXPECT_FALSE(rf2o->odometryCalculation(roomScan(60.05), &anchor));
+  EXPECT_EQ(rf2o->getMatchQuality().failure, MatchQuality::Failure::IMPLAUSIBLE_SPEED);
+  EXPECT_GT(rf2o->getMatchQuality().speed, 10.0);
+  rf2o->discardScan();
+  EXPECT_TRUE(rf2o->laser_pose_.isApprox(accepted.laser_pose));
+  EXPECT_EQ(rf2o->last_odom_time, accepted.stamp);
+}
+
+TEST_F(MatchQualityTest, TwistSpansConsecutiveRobotPosesAcrossAnchorExit)
+{
+  rf2o->fixed_heading = true;
+  const auto anchor = rf2o->currentReference();
+  const Pose3d initial_head = rf2o->laser_pose_on_robot_;
+  ASSERT_TRUE(rf2o->odometryCalculation(roomScan(60.0), &anchor));
+  Pose3d robot = Pose3d::Identity();
+  robot.translation().x() = 0.03;
+  auto lidar = initial_head.inverse() * robot * initial_head;
+  ASSERT_TRUE(rf2o->odometryCalculation(roomScanFrom(60.1, lidar.translation().x(),
+      lidar.translation().y(), rf2o::getYaw(lidar.rotation())), &anchor));
+  EXPECT_NEAR(rf2o->lin_speed, 0.3, 0.04);
+  EXPECT_NEAR(rf2o->lat_speed, 0.0, 0.04);
+  EXPECT_NEAR(rf2o->ang_speed, 0.0, 1e-6);
+  const auto head = swungExtrinsic(initial_head, 0.1);
+  robot.translation() << 0.04, -0.02, 0.0;
+  lidar = initial_head.inverse() * robot * head;
+  rf2o->setLaserPose(head);
+  ASSERT_TRUE(match(roomScanFrom(60.2, lidar.translation().x(), lidar.translation().y(),
+                                rf2o::getYaw(lidar.rotation()))));
+  EXPECT_NEAR(rf2o->lin_speed, 0.1, 0.05);
+  EXPECT_NEAR(rf2o->lat_speed, -0.2, 0.05);
+  EXPECT_NEAR(rf2o->ang_speed, 0.0, 1e-6);
+}
+
 TEST(RealFormatScan, InitializesAndMatchesTranslation)
 {
   rclcpp::init(0, nullptr);

@@ -59,8 +59,144 @@ protected:
     msg->ranges.resize(720, 2.0);
     node->LaserCallBack(msg);
   }
+  void referencesOn()
+  {
+    node->reference_scans = true;
+    node->confidence_enabled = true;
+    node->rf2o_ref.fixed_heading = true;
+    node->rf2o_ref.max_speed = 6.0;
+    node->reference_max_scans = 8;
+  }
+  void scene(double t, double x = 0.0, double wheel = 0.0,
+             double head = 0.0, bool obstacle = false, bool prior = true)
+  {
+    if (prior) odom(t, wheel);
+    tfAt(t, head);
+    auto msg = std::make_shared<sensor_msgs::msg::LaserScan>();
+    msg->header.stamp = rclcpp::Time(static_cast<int64_t>(t * 1e9));
+    msg->header.frame_id = "laser";
+    msg->angle_min = -M_PI;
+    msg->angle_increment = 2 * M_PI / 720;
+    msg->angle_max = msg->angle_min + 719 * msg->angle_increment;
+    msg->range_min = 0.1;
+    msg->range_max = 12;
+    const double hx = x + 0.22 * std::cos(head), hy = 0.22 * std::sin(head);
+    for (int j = 0; j < 720; ++j)
+    {
+      const double a = msg->angle_min + j * msg->angle_increment + head;
+      const double c = std::cos(a), sn = std::sin(a);
+      double r = std::numeric_limits<double>::infinity();
+      if (std::abs(c) > 1e-9) r = std::min(r, ((c > 0 ? 4.0 : -4.0) - hx) / c);
+      if (std::abs(sn) > 1e-9) r = std::min(r, ((sn > 0 ? 4.0 : -4.0) - hy) / sn);
+      if (obstacle && std::abs(a) < 0.2) r = std::min(r, 1.0 / c);
+      msg->ranges.push_back(r + 0.003 * std::sin(j * 13.7 + t * 0.83));
+    }
+    node->LaserCallBack(msg);
+  }
+  void park(bool obstacle = false)
+  {
+    referencesOn();
+    for (int i = 0; i <= 70; ++i) scene(1.0 + i * 0.05, 0, 0, 0, obstacle);
+    ASSERT_FALSE(node->references.empty());
+  }
   std::unique_ptr<rf2o::CLaserOdometry2DNode> node;
 };
+
+TEST_F(Startup, ReferenceParametersRejectInvalidValues)
+{
+  for (const std::string name : {"reference_max_yaw", "reference_max_offset",
+                                "reference_still_distance", "reference_still_time"})
+    for (double value : {0.0, -0.01, std::numeric_limits<double>::infinity(),
+                         std::numeric_limits<double>::quiet_NaN()})
+    {
+      rclcpp::NodeOptions options;
+      options.parameter_overrides({rclcpp::Parameter(name, value)});
+      EXPECT_THROW(rf2o::CLaserOdometry2DNode invalid(options), std::invalid_argument);
+    }
+  for (int limit : {0, -1, 4097})
+  {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides({rclcpp::Parameter("reference_max_scans", limit)});
+    EXPECT_THROW(rf2o::CLaserOdometry2DNode invalid(options), std::invalid_argument);
+  }
+}
+
+TEST_F(Startup, ReferenceEntryBumpAndWheelCreepExit)
+{
+  park();
+  for (int i = 1; i <= 5; ++i) scene(4.5 + i * 0.05, 0.03);
+  EXPECT_NEAR(node->rf2o_ref.robot_pose_.translation().x(), 0.03, 0.01);
+  EXPECT_LT(node->rf2o_ref.getMatchQuality().speed, 1.0);
+  for (int i = 1; i <= 20; ++i) scene(4.75 + i * 0.05, 0.03 + i * 0.001, i * 0.001);
+  EXPECT_TRUE(node->references.empty());
+  EXPECT_NEAR(node->rf2o_ref.robot_pose_.translation().x(), 0.05, 0.012);
+}
+
+TEST_F(Startup, LongWheelSlipPushRemainsMeasured)
+{
+  park();
+  for (int i = 1; i <= 300; ++i) scene(4.5 + i * 0.05, i * 0.0005);
+  EXPECT_NEAR(node->rf2o_ref.robot_pose_.translation().x(), 0.15, 0.02);
+  EXPECT_GT(node->rf2o_ref.last_odom_time.seconds(), 19.0);
+}
+
+TEST_F(Startup, NonRepeatingHeadAnglesHaveABoundedReferenceBank)
+{
+  referencesOn();
+  node->reference_max_yaw = 1e-6;
+  size_t largest = 0;
+  for (int i = 0; i <= 400; ++i)
+  {
+    scene(1.0 + i * 0.05, 0, 0, i * 0.011);
+    largest = std::max(largest, node->references.size());
+    ASSERT_LE(node->references.size(), 8u);
+  }
+  EXPECT_EQ(largest, 8u);
+  EXPECT_TRUE(node->rf2o_ref.robot_pose_.matrix().allFinite());
+  EXPECT_DOUBLE_EQ(node->rf2o_ref.last_odom_time.seconds(), 21.0);
+}
+
+TEST_F(Startup, ObstacleCapturedInAnchorDoesNotBecomeRobotMotion)
+{
+  park(true);
+  for (int i = 1; i <= 80; ++i) scene(4.5 + i * 0.05);
+  EXPECT_LT(node->rf2o_ref.robot_pose_.translation().head<2>().norm(), 0.02);
+  EXPECT_GT(node->rf2o_ref.last_odom_time.seconds(), 8.0);
+}
+
+TEST_F(Startup, PriorLossClearsAnchorsAndRecoversWithMovingHead)
+{
+  park();
+  for (int i = 1; i <= 40; ++i)
+    scene(4.5 + i * 0.05, i * 0.0005, 0, i * 0.002, false, false);
+  EXPECT_FALSE(node->has_odom_prior);
+  EXPECT_TRUE(node->references.empty());
+  for (int i = 41; i <= 80; ++i)
+    scene(4.5 + i * 0.05, i * 0.0005, i * 0.0005, i * 0.002);
+  EXPECT_TRUE(node->has_odom_prior);
+  EXPECT_NEAR(node->rf2o_ref.robot_pose_.translation().x(), 0.04, 0.012);
+  EXPECT_GT(node->rf2o_ref.last_odom_time.seconds(), 8.0);
+}
+
+TEST_F(Startup, AnchorSeedRequiresFiniteCoveredPrior)
+{
+  tf();
+  odom(1.0, 0.0);
+  scan(1.0);
+  rf2o::CLaserOdometry2DNode::Reference ref{
+      node->rf2o_ref.currentReference(), {1.0, 0.0, 0.0, 0.0}, Eigen::Vector2d::Zero()};
+  node->rf2o_ref.current_scan_time = rclcpp::Time(int64_t{2000000000}, RCL_ROS_TIME);
+  const auto before = node->rf2o_ref.kai_loc_old_;
+  EXPECT_FALSE(node->seedFromReference(ref));
+  node->has_odom_prior = true;
+  EXPECT_FALSE(node->seedFromReference(ref));
+  odom(2.0, 0.01);
+  ref.odom.x = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(node->seedFromReference(ref));
+  EXPECT_TRUE(node->rf2o_ref.kai_loc_old_.isApprox(before));
+  ref.odom.x = 0.0;
+  EXPECT_TRUE(node->seedFromReference(ref));
+}
 
 TEST_F(Startup, WaitsForFutureOdomAndTfThenSeedsAtScanStamp)
 {
