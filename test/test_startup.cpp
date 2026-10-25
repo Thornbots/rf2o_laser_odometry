@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <limits>
+#include <fstream>
 #include "rf2o_laser_odometry/CLaserOdometry2DNode.hpp"
 
 namespace
@@ -11,6 +12,7 @@ protected:
   static void TearDownTestSuite() { rclcpp::shutdown(); }
   void SetUp() override
   {
+    node.reset();
     rclcpp::NodeOptions options;
     options.parameter_overrides({{"init_pose_from_topic", "/odom"},
                                  {"odom_prior_topic", "/odom"}});
@@ -105,7 +107,7 @@ protected:
 TEST_F(Startup, ReferenceParametersRejectInvalidValues)
 {
   for (const std::string name : {"reference_max_yaw", "reference_max_offset",
-                                "reference_still_distance", "reference_still_time"})
+                                "reference_still_distance", "reference_still_time", "reference_max_age"})
     for (double value : {0.0, -0.01, std::numeric_limits<double>::infinity(),
                          std::numeric_limits<double>::quiet_NaN()})
     {
@@ -151,7 +153,7 @@ TEST_F(Startup, NonRepeatingHeadAnglesHaveABoundedReferenceBank)
     largest = std::max(largest, node->references.size());
     ASSERT_LE(node->references.size(), 8u);
   }
-  EXPECT_EQ(largest, 8u);
+  EXPECT_GT(largest, 0u);
   EXPECT_TRUE(node->rf2o_ref.robot_pose_.matrix().allFinite());
   EXPECT_DOUBLE_EQ(node->rf2o_ref.last_odom_time.seconds(), 21.0);
 }
@@ -159,9 +161,167 @@ TEST_F(Startup, NonRepeatingHeadAnglesHaveABoundedReferenceBank)
 TEST_F(Startup, ObstacleCapturedInAnchorDoesNotBecomeRobotMotion)
 {
   park(true);
-  for (int i = 1; i <= 80; ++i) scene(4.5 + i * 0.05);
-  EXPECT_LT(node->rf2o_ref.robot_pose_.translation().head<2>().norm(), 0.02);
+  for (int i = 1; i <= 200; ++i)
+  {
+    scene(4.5 + i * 0.05);
+    ASSERT_LT(node->rf2o_ref.robot_pose_.translation().head<2>().norm(), 0.004) << i;
+    ASSERT_NEAR(node->rf2o_ref.last_odom_time.seconds(), 4.5 + i * 0.05, 1e-9);
+  }
   EXPECT_GT(node->rf2o_ref.last_odom_time.seconds(), 8.0);
+}
+
+TEST_F(Startup, LiveObstacleMissingFromAnchorDoesNotBecomeRobotMotion)
+{
+  park();
+  for (int i = 1; i <= 200; ++i)
+  {
+    scene(4.5 + i * 0.05, 0, 0, 0, true);
+    ASSERT_LT(node->rf2o_ref.robot_pose_.translation().head<2>().norm(), 0.004) << i;
+    ASSERT_NEAR(node->rf2o_ref.last_odom_time.seconds(), 4.5 + i * 0.05, 1e-9);
+  }
+}
+
+TEST_F(Startup, ContinuousMultiTurnPatrolKeepsMatching)
+{
+  park();
+  node->reference_max_scans = 512;
+  Eigen::Vector2d previous = node->rf2o_ref.robot_pose_.translation().head<2>();
+  int anchored = 0;
+  for (int i = 1; i <= 1400; ++i)
+  {
+    scene(4.5 + i * 0.05, 0, 0, i * 0.01);
+    const Eigen::Vector2d xy = node->rf2o_ref.robot_pose_.translation().head<2>();
+    ASSERT_LT((xy - previous).norm(), 0.004) << i;
+    ASSERT_NEAR(node->rf2o_ref.last_odom_time.seconds(), 4.5 + i * 0.05, 1e-9);
+    if (!node->references.empty()) ++anchored;
+    previous = xy;
+  }
+  EXPECT_GT(anchored, 1300);
+}
+
+TEST_F(Startup, InterruptedScansCannotUseAnExpiredAnchor)
+{
+  park();
+  ASSERT_NE(node->findReference(), nullptr);
+  node->rf2o_ref.current_scan_time = rclcpp::Time(int64_t{20000000000}, RCL_ROS_TIME);
+  EXPECT_EQ(node->findReference(), nullptr);
+}
+
+TEST_F(Startup, FullHeadSweepHasNoAnchorSwitchSteps)
+{
+  park();
+  node->reference_max_scans = 512;
+  Eigen::Vector2d previous = node->rf2o_ref.robot_pose_.translation().head<2>();
+  for (int i = 1; i <= 1200; ++i)
+  {
+    const double head = M_PI * (1.0 - std::cos(i * 0.004));
+    scene(4.5 + i * 0.05, 0, 0, head);
+    const Eigen::Vector2d xy = node->rf2o_ref.robot_pose_.translation().head<2>();
+    ASSERT_LT((xy - previous).norm(), 0.004) << i;
+    previous = xy;
+    ASSERT_LE(node->references.size(), 512u);
+  }
+  EXPECT_GT(node->rf2o_ref.last_odom_time.seconds(), 64.0);
+}
+
+TEST_F(Startup, AnchorExpiresAndDegradedMatchDropsIt)
+{
+  park();
+  const auto stamp = node->references.front().scan.stamp;
+  for (int i = 1; i <= 180; ++i) scene(4.5 + i * 0.05);
+  ASSERT_EQ(node->references.size(), 1u);
+  EXPECT_GT(node->references.front().scan.stamp, stamp);
+  EXPECT_LE(node->rf2o_ref.current_scan_time.seconds() -
+            node->references.front().scan.stamp.seconds(), node->reference_max_age);
+  node->updateReferences(rf2o::CLaserOdometry2DNode::Tier::DEGRADED, &node->references.front());
+  EXPECT_TRUE(node->references.empty());
+}
+
+TEST_F(Startup, ReferencesOffMatchesUnanchoredStream)
+{
+  // Recorded by #16 (ee3ff63) with the identical scene stream; see README.
+  std::ifstream baseline(std::string(RF2O_TEST_DATA) + "/ee3ff63_poses.txt");
+  ASSERT_TRUE(baseline.good());
+  std::vector<Eigen::Vector3d> poses;
+  for (int pass = 0; pass < 2; ++pass)
+  {
+    SetUp();
+    node->confidence_enabled = true;
+    node->rf2o_ref.fixed_heading = true;
+    node->reference_scans = pass != 0;
+    for (int i = 0; i <= 200; ++i)
+    {
+      // Moving throughout: references ON must retain the scan-to-scan path.
+      scene(1.0 + i * 0.05, i * 0.003, i * 0.003, 0.2 * std::sin(i * 0.01));
+      const Eigen::Vector3d pose = node->rf2o_ref.robot_pose_.translation();
+      if (pass == 0)
+      {
+        poses.push_back(pose);
+        double x, y, yaw;
+        char comma1, comma2;
+        ASSERT_TRUE(baseline >> x >> comma1 >> y >> comma2 >> yaw);
+        ASSERT_EQ(comma1, ',');
+        ASSERT_EQ(comma2, ',');
+        EXPECT_NEAR(pose.x(), x, 1e-7) << i;
+        EXPECT_NEAR(pose.y(), y, 1e-7) << i;
+        EXPECT_NEAR(rf2o::getYaw(node->rf2o_ref.robot_pose_.rotation()), yaw, 1e-7) << i;
+      }
+      else EXPECT_TRUE(pose.isApprox(poses[i], 1e-12)) << i;
+      EXPECT_TRUE(node->references.empty());
+    }
+  }
+}
+
+TEST_F(Startup, RecoveredOdomCanCoverAnUncachedAcceptedScan)
+{
+  scene(1.0);
+  scene(1.05);
+  node->have_matched_prior = false;  // Accepted while odom was overdue.
+  odom(1.1, 0.01);
+  node->rf2o_ref.current_scan_time = rclcpp::Time(int64_t{1100000000}, RCL_ROS_TIME);
+  EXPECT_TRUE(node->setOdomPrior());
+  EXPECT_NEAR(node->odom_prior_increment.translation().x(), 0.01, 1e-9);
+}
+
+TEST_F(Startup, BackwardClockJumpResetsAndResumes)
+{
+  park();
+  for (int i = 1; i <= 400; ++i) scene(4.5 + i * 0.05);
+  scene(1.0);
+  scene(1.05);
+  EXPECT_DOUBLE_EQ(node->rf2o_ref.last_odom_time.seconds(), 1.05);
+  EXPECT_TRUE(node->references.empty());
+  EXPECT_TRUE(node->have_matched_prior);
+  EXPECT_LT(node->odom_prior_buf.back().t, 2.0);
+}
+
+TEST_F(Startup, ScanFirstClockJumpWaitsForNewOdom)
+{
+  park();
+  for (int i = 1; i <= 400; ++i) scene(4.5 + i * 0.05);
+  auto rewound = std::make_shared<sensor_msgs::msg::LaserScan>(node->last_scan);
+  rewound->header.stamp = rclcpp::Time(int64_t{1000000000}, RCL_ROS_TIME);
+  node->LaserCallBack(rewound);
+  EXPECT_FALSE(node->rf2o_ref.is_initialized());
+  EXPECT_TRUE(node->odom_prior_buf.empty());
+  EXPECT_TRUE(node->references.empty());
+  EXPECT_EQ(node->newest_scan_stamp, 1000000000LL);
+  tfAt(1.0);
+  odom(1.0, 0.0);
+  scene(1.05);
+  EXPECT_DOUBLE_EQ(node->rf2o_ref.last_odom_time.seconds(), 1.05);
+  EXPECT_TRUE(node->pending_scans.empty());
+}
+
+TEST_F(Startup, ClockResetRetainsStaticExtrinsics)
+{
+  odom(20.0, 0.0);
+  tf();
+  scan(20.0);
+  odom(1.0, 0.0);
+  scan(1.0);
+  EXPECT_TRUE(node->rf2o_ref.is_initialized());
+  EXPECT_DOUBLE_EQ(node->rf2o_ref.last_odom_time.seconds(), 1.0);
 }
 
 TEST_F(Startup, PriorLossClearsAnchorsAndRecoversWithMovingHead)

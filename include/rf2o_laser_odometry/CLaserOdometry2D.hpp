@@ -226,6 +226,7 @@ public:
   // Methods
   bool match(const sensor_msgs::msg::LaserScan& scan);
   const ReferenceScan* reference_ = nullptr;
+  Eigen::Matrix3f initial_warp_ = Eigen::Matrix3f::Identity();
   void createImagePyramid();
   void calculateCoord();
   void performWarping();

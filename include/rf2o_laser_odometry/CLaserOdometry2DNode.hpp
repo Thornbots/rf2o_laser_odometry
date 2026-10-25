@@ -88,6 +88,7 @@ public:
   bool odomPriorAt(double t, OdomSample &out) const;
   bool setOdomPrior();
   void drainPendingScans();
+  void resetClockHistory();
   std::deque<sensor_msgs::msg::LaserScan::SharedPtr> pending_scans;
   rclcpp::TimerBase::SharedPtr pending_timer;
   int64_t newest_scan_stamp = -1;
@@ -98,11 +99,12 @@ public:
   // position at its stamp, to seed matches and drop it once the robot moves.
   struct Reference { ReferenceScan scan; OdomSample odom; Eigen::Vector2d robot_xy; };
   bool                reference_scans;
-  int                 reference_max_scans;
+  int                 reference_max_scans;    // legacy bank control, validated for compatibility
   double              reference_max_offset;   // m rf2o may move from one
-  double              reference_max_yaw;      // rad of head swing from one
+  double              reference_max_yaw;      // legacy bank control, validated for compatibility
   double              reference_still_distance;  // m odom may wander while parked
   double              reference_still_time;   // s odom must stay put first
+  double              reference_max_age;      // s before refreshing the parked anchor
   OdomSample          still_odom{0, 0, 0, 0};
   double              still_since = -1.0;     // s; -1 without odom
   std::vector<Reference>                                        references;

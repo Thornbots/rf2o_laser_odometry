@@ -98,10 +98,13 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(const rclcpp::NodeOptions &options)
   this->get_parameter("reference_still_distance", reference_still_distance);
   this->declare_parameter<double>("reference_still_time", 2.0);
   this->get_parameter("reference_still_time", reference_still_time);
+  reference_max_age = declare_parameter<double>("reference_max_age", 7.5);
+  // Legacy bank controls remain accepted for #17 configuration compatibility.
+  // A park now has one anchor, regardless of its head angle.
   this->declare_parameter<int>("reference_max_scans", 128);
   this->get_parameter("reference_max_scans", reference_max_scans);
   for (double tolerance : {reference_max_offset, reference_max_yaw,
-                           reference_still_distance, reference_still_time})
+                           reference_still_distance, reference_still_time, reference_max_age})
     if (!std::isfinite(tolerance) || tolerance <= 0.0)
       throw std::invalid_argument("reference tolerances must be finite and positive");
   if (reference_max_scans <= 0 || reference_max_scans > 4096)
@@ -168,6 +171,8 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(const rclcpp::NodeOptions &options)
 void CLaserOdometry2DNode::LaserCallBack(const sensor_msgs::msg::LaserScan::SharedPtr new_scan)
 {
   const int64_t stamp = rclcpp::Time(new_scan->header.stamp).nanoseconds();
+  if (newest_scan_stamp - stamp > 1000000000LL)
+    resetClockHistory();
   if (stamp <= newest_scan_stamp ||
       (rf2o_ref.is_initialized() && !rf2o_ref.acceptsScanGeometry(*new_scan)))
     return;
@@ -183,6 +188,26 @@ void CLaserOdometry2DNode::LaserCallBack(const sensor_msgs::msg::LaserScan::Shar
     pending_scans.pop_front();
   }
   drainPendingScans();
+}
+
+
+void CLaserOdometry2DNode::resetClockHistory()
+{
+  RCLCPP_WARN(get_logger(), "Clock jumped backwards by more than 1 s; resetting scan and odometry history");
+  odom_prior_buf.clear();
+  buffer_->clear();
+  pending_scans.clear();
+  newest_scan_stamp = -1;
+  references.clear();
+  still_since = -1.0;
+  have_matched_prior = false;
+  has_odom_prior = false;
+  odom_prior_increment = Pose3d::Identity();
+  rf2o_ref.first_laser_scan = true;
+  rf2o_ref.module_initialized = false;
+  last_scan_stamp = rclcpp::Time(0, 0, RCL_ROS_TIME);
+  last_failed_scan_stamp = last_scan_stamp;
+  failed_extra = recovery_step = min_scan_gap = 0.0;
 }
 
 
@@ -424,7 +449,7 @@ void CLaserOdometry2DNode::process()
   }
 
   if (reference_scans)
-    updateReferences(confidence_enabled ? tier : solved ? Tier::GOOD : Tier::FAILED, ref);
+    updateReferences(tier, ref);
 
   // Position covariance in odom_frame_id: the floor, plus the tier's
   // inflation along each weak axis of the match, rotated out of the laser
@@ -543,6 +568,11 @@ void CLaserOdometry2DNode::odomPriorCallBack(const nav_msgs::msg::Odometry::Shar
     return;
   if (!odom_prior_buf.empty())
   {
+    if (odom_prior_buf.back().t - s.t > 1.0)
+      resetClockHistory();
+  }
+  if (!odom_prior_buf.empty())
+  {
     if (s.t == odom_prior_buf.back().t)
       return;  // duplicate stamp
     if (s.t < odom_prior_buf.back().t)
@@ -591,7 +621,7 @@ bool CLaserOdometry2DNode::odomPriorAt(double t, OdomSample &out) const
 bool CLaserOdometry2DNode::setOdomPrior()
 {
   OdomSample p0 = matched_prior, p1;
-  if (!have_matched_prior ||
+  if ((!have_matched_prior && !odomPriorAt(rf2o_ref.last_odom_time.seconds(), p0)) ||
       !odomPriorAt(rf2o_ref.current_scan_time.seconds(), p1))
   {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -651,24 +681,15 @@ bool CLaserOdometry2DNode::parked()
 
 
 /**
- * The reference whose extrinsic is closest in yaw to this scan's, within
- * reference_max_yaw, or null.
+ * One anchor per park; the matcher prewarps the stamped head offset before
+ * solving residual robot motion. No independent head-angle chains exist.
  */
 const CLaserOdometry2DNode::Reference *CLaserOdometry2DNode::findReference() const
 {
-  const Reference *best = nullptr;
-  double best_yaw = reference_max_yaw;
-  for (const auto &r : references)
-  {
-    const Pose3d rel = r.scan.laser_pose_on_robot.inverse() * rf2o_ref.laser_pose_on_robot_;
-    const double yaw = std::abs(rf2o::getYaw(rel.rotation()));
-    if (yaw <= best_yaw)
-    {
-      best = &r;
-      best_yaw = yaw;
-    }
-  }
-  return best;
+  if (references.empty() || rf2o_ref.current_scan_time.seconds() -
+      references.front().scan.stamp.seconds() >= reference_max_age)
+    return nullptr;
+  return &references.front();
 }
 
 
@@ -700,28 +721,31 @@ bool CLaserOdometry2DNode::seedFromReference(const Reference &ref)
 
 
 /**
- * After a match: a failed one drops every reference. Otherwise drop those
- * rf2o's pose has moved reference_max_offset from and, while parked, keep a
- * good match as a new reference if none covered its head angle.
+ * Drop weak, moved or expired anchors. Refresh from a good anchored scan
+ * before expiry, so a new anchor inherits the current accepted frame.
  */
 void CLaserOdometry2DNode::updateReferences(Tier tier, const Reference *used)
 {
-  if (tier == Tier::FAILED)
+  if (tier != Tier::GOOD)
   {
     references.clear();
     return;
   }
   const Eigen::Vector2d xy = rf2o_ref.robot_pose_.translation().head<2>();
-  const bool covered = used != nullptr;
+  const double t = rf2o_ref.current_scan_time.seconds();
+  // Refresh while still anchored; an interruption past the deadline cannot
+  // use an expired scan to publish one last biased pose.
+  const bool refresh = used && t - used->scan.stamp.seconds() >= 0.9 * reference_max_age;
   references.erase(std::remove_if(references.begin(), references.end(),
-      [&](const Reference &r) { return (r.robot_xy - xy).norm() > reference_max_offset; }),
+      [&](const Reference &r) {
+        return (refresh && &r == used) || t - r.scan.stamp.seconds() >= reference_max_age ||
+            (r.robot_xy - xy).norm() > reference_max_offset;
+      }),
       references.end());
   OdomSample odom;
-  if (tier == Tier::GOOD && !covered && parked() &&
+  if (references.empty() && parked() &&
       odomPriorAt(rf2o_ref.current_scan_time.seconds(), odom))
   {
-    if (references.size() >= static_cast<size_t>(reference_max_scans))
-      references.erase(references.begin());
     references.push_back(Reference{rf2o_ref.currentReference(), odom, xy});
   }
 }

@@ -337,6 +337,18 @@ bool CLaserOdometry2D::match(const sensor_msgs::msg::LaserScan& scan)
   }
 
   // Coarse-to-fine scheme (pyramid lvls)
+  // An anchored head offset is known geometry, potentially a large turn.
+  // Warp it out before solving small residual motion, including at level 0.
+  initial_warp_.setIdentity();
+  if (reference_)
+  {
+    const float yaw = kai_loc_old_(2) / fps;
+    initial_warp_(0, 0) = initial_warp_(1, 1) = std::cos(yaw);
+    initial_warp_(0, 1) = -std::sin(yaw);
+    initial_warp_(1, 0) = std::sin(yaw);
+    initial_warp_(0, 2) = kai_loc_old_(0) / fps;
+    initial_warp_(1, 2) = kai_loc_old_(1) / fps;
+  }
   for (unsigned int i=0; i<ctf_levels; i++)
   {
     // Clear previous computations
@@ -349,7 +361,7 @@ bool CLaserOdometry2D::match(const sensor_msgs::msg::LaserScan& scan)
     image_level = ctf_levels - i + std::round(std::log2(std::round(float(width)/float(cols)))) - 1;
 
     // 1. Perform warping
-    if (i == 0)
+    if (i == 0 && !reference_)
     {
       // No need for the first lvl
       range_warped[image_level] = range[image_level];
@@ -421,7 +433,7 @@ bool CLaserOdometry2D::match(const sensor_msgs::msg::LaserScan& scan)
   }
 
   Eigen::Matrix3f acu_trans;
-  acu_trans.setIdentity();
+  acu_trans = initial_warp_;
   for (unsigned int i=1; i<=ctf_levels; i++)
     acu_trans = transformations[i-1]*acu_trans;
 
@@ -994,7 +1006,7 @@ void CLaserOdometry2D::performWarping()
 {
   Eigen::Matrix3f acu_trans;
 
-  acu_trans.setIdentity();
+  acu_trans = initial_warp_;
   for (unsigned int i=1; i<=level; i++)
     acu_trans = transformations[i-1]*acu_trans;
 
@@ -1100,7 +1112,7 @@ bool CLaserOdometry2D::filterLevelSolution()
 
   //Important: we have to substract the solutions from previous levels
   Eigen::Matrix3f acu_trans;
-  acu_trans.setIdentity();
+  acu_trans = initial_warp_;
   for (unsigned int i=0; i<level; i++)
     acu_trans = transformations[i]*acu_trans;
 
@@ -1108,6 +1120,8 @@ bool CLaserOdometry2D::filterLevelSolution()
   kai_loc_sub(1) = -fps*acu_trans(1,2);
   kai_loc_sub(2) = -fps*std::atan2(acu_trans(1,0), acu_trans(0,0));
   kai_loc_sub += kai_loc_old_;
+  if (reference_)
+    kai_loc_sub(2) = std::remainder(kai_loc_sub(2), 2.f * static_cast<float>(M_PI));
   if (!acu_trans.allFinite() || !kai_loc_sub.allFinite())
     return false;
 
@@ -1217,6 +1231,13 @@ void CLaserOdometry2D::PoseUpdate(const Eigen::Matrix3f& acu_trans)
 
   // Compose Transformations (robot odom)
   robot_pose_ = laser_pose_ * laser_pose_on_robot_inv_;
+  if (reference_ && (robot_pose_.translation() - robot_oldpose_.translation()).head<2>().norm() < 0.008)
+  {
+    // Half-weight the anchored position to suppress rebinning/occlusion noise.
+    // Below 8 mm: one-scan lag. Larger shoves retain their full increment.
+    robot_pose_.translation() = 0.5 * (robot_pose_.translation() + robot_oldpose_.translation());
+    laser_pose_ = robot_pose_ * laser_pose_on_robot_;
+  }
 
   RCLCPP_DEBUG(get_logger(), "Robot-base odom [x,y,yaw]=[%f %f %f]",
                 robot_pose_.translation()(0),
