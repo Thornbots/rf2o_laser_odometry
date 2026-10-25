@@ -81,3 +81,9 @@ implementation at commit `ee3ff6393b626bbcbe17fd821aa1d14f6b489726` (#16).
 The same stream with references enabled but never parked must match it too.
 The fixture records x, y and yaw; the test constructs the scan stream and
 requires every accepted pose to agree within 0.1 micrometre/radian.
+
+The registered unit tests run with `colcon test --packages-select
+rf2o_laser_odometry`, without GTest sharding. Startup, reference motion,
+reference lifecycle and clock-reset regressions use separate executables
+with 120-second CTest limits. This bounds per-process ROS/DDS and TF-listener
+construction churn; the matcher tests remain in their own executable.
