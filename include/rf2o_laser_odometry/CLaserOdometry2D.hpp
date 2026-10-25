@@ -87,6 +87,16 @@ struct MatchQuality
 
 const char* failureName(MatchQuality::Failure f);
 
+// A matched scan kept so later scans from nearly the same laser pose match
+// against it instead of the scan before them; see the node's reference_scans.
+struct ReferenceScan
+{
+  std::vector<Eigen::MatrixXf> range, xx, yy;  // its pyramid
+  Pose3d laser_pose;           // odom frame, as matched
+  Pose3d laser_pose_on_robot;  // extrinsic at its stamp
+  rclcpp::Time stamp;
+};
+
 
 class CLaserOdometry2D: public rclcpp::Node
 {
@@ -102,7 +112,13 @@ public:
   // Reject changes to the initialized angular grid before touching matcher state.
   bool acceptsScanGeometry(const sensor_msgs::msg::LaserScan& scan);
 
-  bool odometryCalculation(const sensor_msgs::msg::LaserScan& scan);
+  // Match scan against ref, or the previous scan if null. A failed match
+  // against ref leaves the pose where the previous scan put it.
+  bool odometryCalculation(const sensor_msgs::msg::LaserScan& scan,
+                           const ReferenceScan* ref = nullptr);
+
+  // The last matched scan, as a reference for later scans.
+  ReferenceScan currentReference() const;
 
   void setLaserPose(const Pose3d& laser_pose);
 
@@ -180,7 +196,7 @@ public:
   unsigned int iter_irls;
   float g_mask[5];
 
-  double lin_speed, ang_speed;
+  double lin_speed = 0.0, lat_speed = 0.0, ang_speed = 0.0;
 
   //rclcpp::wall	m_runtime;
 
@@ -208,6 +224,8 @@ public:
   std::vector<double> last_m_ang_speeds;
 
   // Methods
+  bool match(const sensor_msgs::msg::LaserScan& scan);
+  const ReferenceScan* reference_ = nullptr;
   void createImagePyramid();
   void calculateCoord();
   void performWarping();

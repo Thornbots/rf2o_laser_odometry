@@ -251,7 +251,51 @@ bool CLaserOdometry2D::acceptsScanGeometry(const sensor_msgs::msg::LaserScan& sc
  * Odometry estimation in ROS is cumulative, that is, it adds incrementally to update the robot "odom"
  * @param scan the last laser scan received (will be compared with the previous one stored)
 */
-bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& scan)
+bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& scan,
+                                           const ReferenceScan* ref)
+{
+  const Pose3d pose = laser_pose_, extrinsic = laser_pose_on_robot_prev_;
+  const rclcpp::Time time = last_odom_time;
+  ReferenceScan accepted;
+  if (ref)
+    accepted = currentReference();
+  reference_ = ref;
+  const bool solved = match(scan);
+  reference_ = nullptr;
+  if (!solved && ref)
+  {
+    laser_pose_ = pose;
+    laser_pose_on_robot_prev_ = extrinsic;
+    last_odom_time = time;
+    // discardScan() must restore the accepted consecutive pyramid, not the anchor.
+    if (pending_scan_)
+    {
+      range_old = accepted.range;
+      xx_old = accepted.xx;
+      yy_old = accepted.yy;
+    }
+  }
+  else if (ref)
+  {
+    // The constant-velocity prior is one scan's motion, from the previous
+    // scan's pose, not the whole span since the reference.
+    const Eigen::Vector3d d = laser_pose_.translation() - pose.translation();
+    const double phi = rf2o::getYaw(laser_pose_.rotation());
+    kai_loc_old_(0) = d.x() * std::cos(phi) + d.y() * std::sin(phi);
+    kai_loc_old_(1) = -d.x() * std::sin(phi) + d.y() * std::cos(phi);
+    kai_loc_old_(2) = std::remainder(phi - rf2o::getYaw(pose.rotation()), 2.0 * M_PI);
+  }
+  return solved;
+}
+
+
+ReferenceScan CLaserOdometry2D::currentReference() const
+{
+  return ReferenceScan{range, xx, yy, laser_pose_, laser_pose_on_robot_prev_, last_odom_time};
+}
+
+
+bool CLaserOdometry2D::match(const sensor_msgs::msg::LaserScan& scan)
 {
   //=====================================
   //	DIFERENTIAL  ODOMETRY  MULTILEVEL
@@ -282,6 +326,15 @@ bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& sc
   // Create pyramid from current scan
   createImagePyramid();
   pending_scan_ = true;
+  if (reference_)
+  {
+    // Substitute anchor geometry; timing remains consecutive accepted scans.
+    range_old = reference_->range;
+    xx_old = reference_->xx;
+    yy_old = reference_->yy;
+    laser_pose_ = reference_->laser_pose;
+    laser_pose_on_robot_prev_ = reference_->laser_pose_on_robot;
+  }
 
   // Coarse-to-fine scheme (pyramid lvls)
   for (unsigned int i=0; i<ctf_levels; i++)
@@ -387,7 +440,8 @@ bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& sc
     Pose3d laser_inc = Pose3d::Identity();
     laser_inc = rf2o::matrixYaw(static_cast<double>(std::atan2(acu_trans(1,0), acu_trans(0,0))));
     laser_inc.translation() << acu_trans(0,2), acu_trans(1,2), 0.0;
-    const Pose3d robot_inc = laser_pose_on_robot_prev_ * laser_inc * laser_pose_on_robot_inv_;
+    const Pose3d candidate = laser_pose_ * laser_inc * laser_pose_on_robot_inv_;
+    const Pose3d robot_inc = robot_pose_.inverse() * candidate;
     quality_.speed = robot_inc.translation().head<2>().norm() / time_inc_sec;
     if (!robot_inc.matrix().allFinite() || !std::isfinite(quality_.speed))
     {
@@ -1169,24 +1223,15 @@ void CLaserOdometry2D::PoseUpdate(const Eigen::Matrix3f& acu_trans)
                 robot_pose_.translation()(1),
                 rf2o::getYaw(robot_pose_.rotation()));
 
-  // Estimate linear/angular speeds (mandatory for base_local_planner)
-  // last_scan -> the last scan received
-  // last_odom_time -> The time of the previous scan lasser used to estimate the pose
-  //-------------------------------------------------------------------------------------
-  double time_inc_sec = (current_scan_time - last_odom_time).seconds();
+  // Twist spans consecutive accepted robot poses, regardless of the scan anchor.
+  const double time_inc_sec = (current_scan_time - last_odom_time).seconds();
+  const Eigen::Vector3d velocity = robot_pose_.linear().transpose() *
+      (robot_pose_.translation() - robot_oldpose_.translation()) / time_inc_sec;
+  lin_speed = velocity.x();
+  lat_speed = velocity.y();
+  ang_speed = std::remainder(rf2o::getYaw(robot_pose_.rotation()) -
+      rf2o::getYaw(robot_oldpose_.rotation()), 2.0 * M_PI) / time_inc_sec;
   last_odom_time = current_scan_time;
-  lin_speed = acu_trans(0,2) / time_inc_sec;
-  //double lin_speed = sqrt( mrpt::math::square(robot_oldpose.x()-robot_pose.x()) + mrpt::math::square(robot_oldpose.y()-robot_pose.y()) )/time_inc_sec;
-
-  double ang_inc = rf2o::getYaw(robot_pose_.rotation()) -
-      rf2o::getYaw(robot_oldpose_.rotation());
-
-  if (ang_inc > 3.14159)
-    ang_inc -= 2*3.14159;
-  if (ang_inc < -3.14159)
-    ang_inc += 2*3.14159;
-
-  ang_speed = ang_inc/time_inc_sec;
   robot_oldpose_ = robot_pose_;
 
   //filter speeds

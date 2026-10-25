@@ -14,6 +14,7 @@
 #include <cstring>
 #include <deque>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 namespace rf2o {
@@ -92,6 +93,23 @@ public:
   int64_t newest_scan_stamp = -1;
   OdomSample matched_prior{};
   bool have_matched_prior = false;
+
+  // Reference scans; see README.md. Each keeps the odom prior and robot
+  // position at its stamp, to seed matches and drop it once the robot moves.
+  struct Reference { ReferenceScan scan; OdomSample odom; Eigen::Vector2d robot_xy; };
+  bool                reference_scans;
+  int                 reference_max_scans;
+  double              reference_max_offset;   // m rf2o may move from one
+  double              reference_max_yaw;      // rad of head swing from one
+  double              reference_still_distance;  // m odom may wander while parked
+  double              reference_still_time;   // s odom must stay put first
+  OdomSample          still_odom{0, 0, 0, 0};
+  double              still_since = -1.0;     // s; -1 without odom
+  std::vector<Reference>                                        references;
+  bool parked();
+  const Reference *findReference() const;
+  bool seedFromReference(const Reference &ref);
+  void updateReferences(Tier tier, const Reference *used);
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr         odom_pub;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr quality_pub;
 

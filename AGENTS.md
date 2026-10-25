@@ -11,7 +11,7 @@ Own scan odometry and match grading. `sentry_localization` owns fusion/tuning
 and `odom->root`; `thornbots_pkg` supplies the filtered scan.
 Preserve the intentional upstream diffs: live head extrinsics, per-scan
 callback matching at scan stamps, real covariances, `fixed_heading`,
-`odom_prior_topic`, no republish after a failed match, and grading from matcher
+`odom_prior_topic`, parked reference scans, no republish after a failed match, and grading from matcher
 evidence, never agreement with the wheel-odometry prior.
 Parameter values live in source and `../sentry_localization/config/rf2o.yaml`.
 

@@ -85,6 +85,27 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(const rclcpp::NodeOptions &options)
   this->get_parameter("max_failed_variance", max_failed_variance);
   this->declare_parameter<int>("recovery_matches", 20);
   this->get_parameter("recovery_matches", recovery_matches);
+  // Match a parked robot's scans against earlier scans from the same head
+  // angle, so scan-match noise stops integrating while it stays put. Parked:
+  // odom within reference_still_distance for reference_still_time.
+  this->declare_parameter<bool>("reference_scans", false);
+  this->get_parameter("reference_scans", reference_scans);
+  this->declare_parameter<double>("reference_max_offset", 0.02);
+  this->get_parameter("reference_max_offset", reference_max_offset);
+  this->declare_parameter<double>("reference_max_yaw", 0.035);
+  this->get_parameter("reference_max_yaw", reference_max_yaw);
+  this->declare_parameter<double>("reference_still_distance", 0.005);
+  this->get_parameter("reference_still_distance", reference_still_distance);
+  this->declare_parameter<double>("reference_still_time", 2.0);
+  this->get_parameter("reference_still_time", reference_still_time);
+  this->declare_parameter<int>("reference_max_scans", 128);
+  this->get_parameter("reference_max_scans", reference_max_scans);
+  for (double tolerance : {reference_max_offset, reference_max_yaw,
+                           reference_still_distance, reference_still_time})
+    if (!std::isfinite(tolerance) || tolerance <= 0.0)
+      throw std::invalid_argument("reference tolerances must be finite and positive");
+  if (reference_max_scans <= 0 || reference_max_scans > 4096)
+    throw std::invalid_argument("reference_max_scans must be in [1, 4096]");
   // Only an applied check may reject a match inside rf2o; otherwise the
   // quality topic reports what would have happened.
   if (confidence_enabled)
@@ -350,8 +371,11 @@ void CLaserOdometry2DNode::process()
   const MatrixS31 previous_prior = rf2o_ref.kai_loc_old_;
   const IncrementCov previous_covariance = rf2o_ref.cov_odo;
   has_odom_prior = !odom_prior_topic.empty() && setOdomPrior();
+  const Reference *ref = reference_scans && parked() ? findReference() : nullptr;
+  if (ref && !seedFromReference(*ref))
+    ref = nullptr;
 
-  const bool solved = rf2o_ref.odometryCalculation(last_scan);
+  const bool solved = rf2o_ref.odometryCalculation(last_scan, ref ? &ref->scan : nullptr);
   const MatchQuality &q = rf2o_ref.getMatchQuality();
 
   // Per-axis std-dev and axes of the match's x/y covariance, laser frame.
@@ -385,6 +409,8 @@ void CLaserOdometry2DNode::process()
 
   if (std::strcmp(increment, "none") == 0)
   {
+    if (reference_scans && tier == Tier::FAILED)
+      references.clear();
     // Keep the pyramid, pose, head reference and wheel reference coherent.
     // The next attempt spans the entire unaccepted interval.
     rf2o_ref.discardScan();
@@ -396,6 +422,9 @@ void CLaserOdometry2DNode::process()
     publishQuality(tier, reason, q, sigma, increment);
     return;
   }
+
+  if (reference_scans)
+    updateReferences(confidence_enabled ? tier : solved ? Tier::GOOD : Tier::FAILED, ref);
 
   // Position covariance in odom_frame_id: the floor, plus the tier's
   // inflation along each weak axis of the match, rotated out of the laser
@@ -595,6 +624,110 @@ bool CLaserOdometry2DNode::setOdomPrior()
 
 
 /**
+ * Whether odom has stayed within reference_still_distance for
+ * reference_still_time. Odom moving, or missing, drops every reference, so
+ * a driving robot matches scan to scan. Odom only picks what to match
+ * against; the match still measures a shove with the wheels held.
+ */
+bool CLaserOdometry2DNode::parked()
+{
+  const double t = rf2o_ref.current_scan_time.seconds();
+  OdomSample odom;
+  if (!has_odom_prior || !odomPriorAt(t, odom))
+  {
+    still_since = -1.0;
+    references.clear();
+    return false;
+  }
+  if (still_since < 0.0 || t < still_since ||
+      std::hypot(odom.x - still_odom.x, odom.y - still_odom.y) > reference_still_distance)
+  {
+    still_odom = odom;
+    still_since = t;
+    references.clear();
+  }
+  return t - still_since >= reference_still_time;
+}
+
+
+/**
+ * The reference whose extrinsic is closest in yaw to this scan's, within
+ * reference_max_yaw, or null.
+ */
+const CLaserOdometry2DNode::Reference *CLaserOdometry2DNode::findReference() const
+{
+  const Reference *best = nullptr;
+  double best_yaw = reference_max_yaw;
+  for (const auto &r : references)
+  {
+    const Pose3d rel = r.scan.laser_pose_on_robot.inverse() * rf2o_ref.laser_pose_on_robot_;
+    const double yaw = std::abs(rf2o::getYaw(rel.rotation()));
+    if (yaw <= best_yaw)
+    {
+      best = &r;
+      best_yaw = yaw;
+    }
+  }
+  return best;
+}
+
+
+/**
+ * Seed the match with odom's motion since the reference, through the
+ * extrinsics at both stamps, as setOdomPrior() does for the previous scan.
+ */
+bool CLaserOdometry2DNode::seedFromReference(const Reference &ref)
+{
+  OdomSample p1;
+  if (!has_odom_prior || !odomPriorAt(rf2o_ref.current_scan_time.seconds(), p1))
+    return false;
+  const OdomSample &p0 = ref.odom;
+  const double c = std::cos(p0.yaw), s = std::sin(p0.yaw);
+  const double dx = p1.x - p0.x, dy = p1.y - p0.y;
+  Pose3d robot_inc = Pose3d::Identity();
+  robot_inc.linear() = rf2o::matrixYaw(std::remainder(p1.yaw - p0.yaw, 2.0 * M_PI));
+  robot_inc.translation() << c * dx + s * dy, -s * dx + c * dy, 0.0;
+  const Pose3d laser_inc =
+      ref.scan.laser_pose_on_robot.inverse() * robot_inc * rf2o_ref.laser_pose_on_robot_;
+  MatrixS31 prior;
+  prior << laser_inc.translation()(0), laser_inc.translation()(1),
+      rf2o::getYaw(laser_inc.rotation());
+  if (!robot_inc.matrix().allFinite() || !laser_inc.matrix().allFinite() || !prior.allFinite())
+    return false;
+  rf2o_ref.kai_loc_old_ = prior;
+  return true;
+}
+
+
+/**
+ * After a match: a failed one drops every reference. Otherwise drop those
+ * rf2o's pose has moved reference_max_offset from and, while parked, keep a
+ * good match as a new reference if none covered its head angle.
+ */
+void CLaserOdometry2DNode::updateReferences(Tier tier, const Reference *used)
+{
+  if (tier == Tier::FAILED)
+  {
+    references.clear();
+    return;
+  }
+  const Eigen::Vector2d xy = rf2o_ref.robot_pose_.translation().head<2>();
+  const bool covered = used != nullptr;
+  references.erase(std::remove_if(references.begin(), references.end(),
+      [&](const Reference &r) { return (r.robot_xy - xy).norm() > reference_max_offset; }),
+      references.end());
+  OdomSample odom;
+  if (tier == Tier::GOOD && !covered && parked() &&
+      odomPriorAt(rf2o_ref.current_scan_time.seconds(), odom))
+  {
+    if (references.size() >= static_cast<size_t>(reference_max_scans))
+      references.erase(references.begin());
+    references.push_back(Reference{rf2o_ref.currentReference(), odom, xy});
+  }
+}
+
+
+/**
  * This function is used to initialize the robot pose before estimating its odometry.
  * By default the odometry will start from pose_0, but when comparing different methods
  * it may be necessary to start from a different pose.
@@ -643,7 +776,7 @@ void CLaserOdometry2DNode::publish(const Eigen::Matrix2d &position_cov)
   //set the velocity
   odom.child_frame_id = base_frame_id;
   odom.twist.twist.linear.x = rf2o_ref.lin_speed;    //linear speed
-  odom.twist.twist.linear.y = 0.0;
+  odom.twist.twist.linear.y = rf2o_ref.lat_speed;
   odom.twist.twist.angular.z = rf2o_ref.ang_speed;   //angular speed
 
   // Report real measurement uncertainty. Both covariance matrices are 6x6
