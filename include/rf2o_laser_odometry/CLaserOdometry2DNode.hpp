@@ -21,7 +21,7 @@ namespace rf2o {
 class CLaserOdometry2DNode : public rclcpp::Node
 {
 public:
-  CLaserOdometry2DNode();
+  explicit CLaserOdometry2DNode(const rclcpp::NodeOptions &options = rclcpp::NodeOptions());
   enum class Tier { GOOD, DEGRADED, FAILED };
 
   void process();
@@ -85,6 +85,12 @@ public:
   std::deque<OdomSample>                                        odom_prior_buf;
   bool odomPriorAt(double t, OdomSample &out) const;
   bool setOdomPrior();
+  void drainPendingScans();
+  std::deque<sensor_msgs::msg::LaserScan::SharedPtr> pending_scans;
+  rclcpp::TimerBase::SharedPtr pending_timer;
+  int64_t newest_scan_stamp = -1;
+  OdomSample matched_prior{};
+  bool have_matched_prior = false;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr         odom_pub;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr quality_pub;
 
@@ -99,3 +105,4 @@ public:
   void odomPriorCallBack(const nav_msgs::msg::Odometry::SharedPtr msg);
 };
 
+}  // namespace rf2o

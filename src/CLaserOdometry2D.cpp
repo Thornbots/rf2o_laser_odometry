@@ -18,6 +18,23 @@
 #include "rf2o_laser_odometry/CLaserOdometry2D.hpp"
 
 namespace rf2o {
+namespace {
+
+bool solveNormalEquations(const Eigen::MatrixXf& AtA, const Eigen::MatrixXf& AtB,
+                          MatrixS31& solution)
+{
+  if (!AtA.allFinite() || !AtB.allFinite())
+    return false;
+  const Eigen::LDLT<Eigen::MatrixXf> decomposition(AtA);
+  if (decomposition.info() != Eigen::Success ||
+      !decomposition.vectorD().allFinite() || (decomposition.vectorD().array() <= 0.f).any())
+    return false;
+  solution = decomposition.solve(AtB);
+  return decomposition.info() == Eigen::Success && solution.allFinite();
+}
+
+}  // namespace
+
 
 
 /**
@@ -98,7 +115,11 @@ void CLaserOdometry2D::init(const sensor_msgs::msg::LaserScan& scan,
   laser_pose_    = robot_initial_pose * laser_pose_on_robot_;
   laser_pose_on_robot_prev_ = laser_pose_on_robot_;
   robot_initial_pose_ = robot_initial_pose;
-  laser_oldpose_ = laser_oldpose_;
+  robot_pose_ = robot_initial_pose;
+  robot_oldpose_ = robot_initial_pose;
+  lin_speed = 0.0;
+  ang_speed = 0.0;
+  laser_oldpose_ = laser_pose_;
 
 
   // Init rf2o module (internal)
@@ -177,6 +198,8 @@ void CLaserOdometry2D::init(const sensor_msgs::msg::LaserScan& scan,
 
   module_initialized = true;
   last_odom_time = scan.header.stamp;   // the time of this first scan
+  last_scan_time_ = last_odom_time;
+  current_scan_time = last_odom_time;
 }
 
 
@@ -238,6 +261,15 @@ bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& sc
     return false;
   }
 
+  const rclcpp::Time scan_time(scan.header.stamp);
+  if (scan_time <= last_scan_time_ || scan_time <= last_odom_time)
+  {
+    quality_.failure = MatchQuality::Failure::TIMESTAMP;
+    return false;
+  }
+  current_scan_time = scan_time;
+  last_scan_time_ = scan_time;
+
   // copy @param scan to internal variable (we already did it for the previous scan)
   range_wf = Eigen::Map<const Eigen::MatrixXf>(scan.ranges.data(), width, 1);
 
@@ -293,7 +325,11 @@ bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& sc
     // 7. Solve odometry
     if (num_valid_range > 3)
     {
-      solveSystemNonLinear();
+      if (!solveSystemNonLinear())
+      {
+        quality_.failure = MatchQuality::Failure::EIGENSOLVER;
+        return false;
+      }
       //solveSystemOneLevel();    //without robust-function
     }
     else
@@ -332,6 +368,12 @@ bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& sc
   for (unsigned int i=1; i<=ctf_levels; i++)
     acu_trans = transformations[i-1]*acu_trans;
 
+  if (!acu_trans.allFinite())
+  {
+    quality_.failure = MatchQuality::Failure::EIGENSOLVER;
+    return false;
+  }
+
   // Physical plausibility of the robot's motion, not agreement with any
   // other odometry source.
   const double time_inc_sec = (current_scan_time - last_odom_time).seconds();
@@ -343,6 +385,11 @@ bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& sc
     laser_inc.translation() << acu_trans(0,2), acu_trans(1,2), 0.0;
     const Pose3d robot_inc = laser_pose_on_robot_prev_ * laser_inc * laser_pose_on_robot_inv_;
     quality_.speed = robot_inc.translation().head<2>().norm() / time_inc_sec;
+    if (!robot_inc.matrix().allFinite() || !std::isfinite(quality_.speed))
+    {
+      quality_.failure = MatchQuality::Failure::EIGENSOLVER;
+      return false;
+    }
     if (max_speed > 0.0 && quality_.speed > max_speed)
     {
       quality_.failure = MatchQuality::Failure::IMPLAUSIBLE_SPEED;
@@ -362,15 +409,20 @@ bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& sc
 }
 
 
-void CLaserOdometry2D::deadReckon(const Pose3d& robot_increment)
+bool CLaserOdometry2D::deadReckon(const Pose3d& robot_increment)
 {
+  if (current_scan_time <= last_odom_time)
+    return false;
   const Pose3d laser_inc = laserIncrement(robot_increment);
   const float yaw = rf2o::getYaw(laser_inc.rotation());
   Eigen::Matrix3f acu_trans;
   acu_trans << std::cos(yaw), -std::sin(yaw), laser_inc.translation()(0),
                std::sin(yaw),  std::cos(yaw), laser_inc.translation()(1),
                0.f, 0.f, 1.f;
+  if (!robot_increment.matrix().allFinite() || !acu_trans.allFinite())
+    return false;
   PoseUpdate(acu_trans);
+  return true;
 }
 
 
@@ -384,6 +436,7 @@ const char* failureName(MatchQuality::Failure f)
     case MatchQuality::Failure::EIGENSOLVER: return "eigensolver";
     case MatchQuality::Failure::IMPLAUSIBLE_SPEED: return "implausible_speed";
     case MatchQuality::Failure::GEOMETRY: return "geometry";
+    case MatchQuality::Failure::TIMESTAMP: return "timestamp";
   }
   return "unknown";
 }
@@ -713,7 +766,7 @@ void CLaserOdometry2D::findNullPoints()
 }
 
 // Solves the system without considering any robust-function
-void CLaserOdometry2D::solveSystemOneLevel()
+bool CLaserOdometry2D::solveSystemOneLevel()
 {
   A.resize(num_valid_range, 3);
   B.resize(num_valid_range, 1);
@@ -744,7 +797,8 @@ void CLaserOdometry2D::solveSystemOneLevel()
   Eigen::MatrixXf AtA, AtB;
   AtA = A.transpose()*A;
   AtB = A.transpose()*B;
-  Var = AtA.ldlt().solve(AtB);
+  if (!solveNormalEquations(AtA, AtB, Var))
+    return false;
 
   //Covariance matrix calculation 	Cov Order -> vx,vy,wz
   Eigen::MatrixXf res(num_valid_range,1);
@@ -752,10 +806,11 @@ void CLaserOdometry2D::solveSystemOneLevel()
   cov_odo = (1.f/float(num_valid_range-3))*AtA.inverse()*res.squaredNorm();
 
   kai_loc_level_ = Var;
+  return cov_odo.allFinite();
 }
 
 // Solves the system by considering the Cauchy M-estimator robust-function
-void CLaserOdometry2D::solveSystemNonLinear()
+bool CLaserOdometry2D::solveSystemNonLinear()
 {
   A.resize(num_valid_range, 3); Aw.resize(num_valid_range, 3);
   B.resize(num_valid_range, 1); Bw.resize(num_valid_range, 1);
@@ -785,7 +840,8 @@ void CLaserOdometry2D::solveSystemNonLinear()
   Eigen::MatrixXf AtA, AtB;
   AtA = A.transpose()*A;
   AtB = A.transpose()*B;
-  Var = AtA.ldlt().solve(AtB);
+  if (!solveNormalEquations(AtA, AtB, Var))
+    return false;
 
   //Covariance matrix calculation 	Cov Order -> vx,vy,wz
   Eigen::MatrixXf res(num_valid_range,1);
@@ -834,7 +890,8 @@ void CLaserOdometry2D::solveSystemNonLinear()
     //Solve the linear system of equations using a minimum least squares method
     AtA = Aw.transpose()*Aw;
     AtB = Aw.transpose()*Bw;
-    Var = AtA.ldlt().solve(AtB);
+    if (!solveNormalEquations(AtA, AtB, Var))
+      return false;
     res = A*Var - B;
 
     ////Compute the energy
@@ -848,6 +905,7 @@ void CLaserOdometry2D::solveSystemNonLinear()
   kai_loc_level_ = Var;
 
   //RCLCPP_INFO_STREAM(get_logger(), "[rf2o] COV_ODO:\n" << cov_odo);
+  return cov_odo.allFinite();
 }
 
 void CLaserOdometry2D::Reset(const Pose3d& ini_pose/*, CObservation2DRangeScan scan*/)
@@ -940,10 +998,17 @@ void CLaserOdometry2D::performWarping()
 
 bool CLaserOdometry2D::filterLevelSolution()
 {
+  if (!kai_loc_level_.allFinite() || !kai_loc_old_.allFinite() ||
+      !std::isfinite(fps) || fps <= 0.f || !cov_odo.allFinite() ||
+      !cov_odo.isApprox(cov_odo.transpose()))
+    return false;
+
   //		Calculate Eigenvalues and Eigenvectors
   //----------------------------------------------------------
   Eigen::SelfAdjointEigenSolver<Eigen::MatrixXf> eigensolver(cov_odo);
-  if (eigensolver.info() != Eigen::Success)
+  if (eigensolver.info() != Eigen::Success ||
+      !eigensolver.eigenvalues().allFinite() || !eigensolver.eigenvectors().allFinite() ||
+      (eigensolver.eigenvalues().array() < 0.f).any())
   {
     RCLCPP_WARN(get_logger(), "WARNING: Eigensolver couldn't find a solution. Pose is not updated");
     return false;
@@ -957,7 +1022,8 @@ bool CLaserOdometry2D::filterLevelSolution()
 
   kai_b = Bii.colPivHouseholderQr().solve(kai_loc_level_);
 
-  assert((kai_loc_level_).isApprox(Bii*kai_b, 1e-5) && "Ax=b has no solution." && __LINE__);
+  if (!kai_b.allFinite() || !kai_loc_level_.isApprox(Bii*kai_b, 1e-5))
+    return false;
 
   //Second, we have to describe both the old linear and angular speeds in the "eigenvector" basis too
   //-------------------------------------------------------------------------------------------------
@@ -971,18 +1037,16 @@ bool CLaserOdometry2D::filterLevelSolution()
 
   kai_loc_sub(0) = -fps*acu_trans(0,2);
   kai_loc_sub(1) = -fps*acu_trans(1,2);
-  if (acu_trans(0,0) > 1.f)
-    kai_loc_sub(2) = 0.f;
-  else
-  {
-    kai_loc_sub(2) = -fps*std::acos(acu_trans(0,0))*rf2o::sign(acu_trans(1,0));
-  }
+  kai_loc_sub(2) = -fps*std::atan2(acu_trans(1,0), acu_trans(0,0));
   kai_loc_sub += kai_loc_old_;
+  if (!acu_trans.allFinite() || !kai_loc_sub.allFinite())
+    return false;
 
   Eigen::Matrix<float,3,1> kai_b_old;
   kai_b_old = Bii.colPivHouseholderQr().solve(kai_loc_sub);
 
-  assert((kai_loc_sub).isApprox(Bii*kai_b_old, 1e-5) && "Ax=b has no solution." && __LINE__);
+  if (!kai_b_old.allFinite() || !kai_loc_sub.isApprox(Bii*kai_b_old, 1e-5))
+    return false;
 
   //Filter speed
   const float cf = 15e3f*std::exp(-float(int(level))),
@@ -995,10 +1059,14 @@ bool CLaserOdometry2D::filterLevelSolution()
     //kai_b_fil_f(i,0) = (1.f*kai_b(i,0) + 0.f*kai_b_old_f(i,0))/(1.0f + 0.f);
   }
 
+  if (!kai_b_fil.allFinite())
+    return false;
+
   //Transform filtered speed to local reference frame and compute transformation
   Eigen::Matrix<float, 3, 1> kai_loc_fil = Bii.inverse().colPivHouseholderQr().solve(kai_b_fil);
 
-  assert((kai_b_fil).isApprox(Bii.inverse()*kai_loc_fil, 1e-5) && "Ax=b has no solution." && __LINE__);
+  if (!kai_loc_fil.allFinite() || !kai_b_fil.isApprox(Bii.inverse()*kai_loc_fil, 1e-5))
+    return false;
 
   //transformation
   const float incrx = kai_loc_fil(0)/fps;
@@ -1012,7 +1080,7 @@ bool CLaserOdometry2D::filterLevelSolution()
   transformations[level](0,2) = incrx;
   transformations[level](1,2) = incry;
 
-  return true;
+  return transformations[level].allFinite();
 }
 
 
@@ -1027,12 +1095,7 @@ void CLaserOdometry2D::PoseUpdate(const Eigen::Matrix3f& acu_trans)
   kai_loc_(0) = fps*acu_trans(0,2);
   kai_loc_(1) = fps*acu_trans(1,2);
 
-  if (acu_trans(0,0) > 1.f)
-    kai_loc_(2) = 0.f;
-  else
-  {
-    kai_loc_(2) = fps*std::acos(acu_trans(0,0))*rf2o::sign(acu_trans(1,0));
-  }
+  kai_loc_(2) = fps*std::atan2(acu_trans(1,0), acu_trans(0,0));
 
   //cout << endl << "Arc cos (incr tita): " << kai_loc_(2);
 

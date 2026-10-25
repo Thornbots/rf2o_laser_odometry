@@ -14,3 +14,19 @@ For every scanned point we formulate the range flow constraint equation in terms
 The very low computational cost (0.9 milliseconds on a single CPU core) together whit its high precision, makes RF2O a suitable method for those robotic applications that require planar odometry.
 
 For a full description of the algorithm, please refer to: **Planar Odometry from a Radial Laser Scanner. A Range Flow-based Approach. ICRA 2016** Available at: http://mapir.uma.es/papersrepo/2016/2016_Jaimez_ICRA_RF2O.pdf
+
+## Scan-time startup
+
+When `init_pose_from_topic` and `odom_prior_topic` name the same nonempty
+odometry topic, the first accepted scan initializes from its interpolated
+odometry pose at that scan's stamp. A distinct init topic keeps its first
+latched pose as the explicit origin; an empty init topic starts at zero.
+
+Scans wait in arrival order for scan-time TF and, when configured, odometry
+coverage. The executor retries without blocking subscriptions. The queue
+holds at most 100 scans and two seconds of scan stamps, dropping the oldest
+on overflow; scans older than available odometry history are discarded.
+Odometry endpoints are never held beyond their stamps. The previous matched
+odometry pose is retained for fallback across a dropped-scan gap. Duplicate
+and backward scan/odometry stamps are ignored; restart the node after a clock
+reset. Invalid solves and covariances fail before updating the pose.
