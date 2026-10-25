@@ -23,7 +23,11 @@ odometry pose at that scan's stamp. A distinct init topic keeps its first
 latched pose as the explicit origin; an empty init topic starts at zero.
 
 Scans wait in arrival order for scan-time TF and, when configured, odometry
-coverage. The executor retries without blocking subscriptions. The queue
+coverage. The executor retries without blocking subscriptions. After
+initialization a scan waits until scans 1 s newer queue: it then runs
+without the odometry prior, or on the latest TF within `max_extrinsic_age`
+(older is skipped as `extrinsic_stale` when `confidence_enabled`), so a
+stalled `/odom` or joint stream degrades instead of stopping rf2o. The queue
 holds at most 100 scans and two seconds of scan stamps, dropping the oldest
 on overflow; scans older than available odometry history are discarded.
 Odometry endpoints are never held beyond their stamps. The previous matched

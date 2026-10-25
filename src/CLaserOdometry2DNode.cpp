@@ -177,24 +177,43 @@ void CLaserOdometry2DNode::drainPendingScans()
       continue;
     }
     const double stamp = rclcpp::Time(scan->header.stamp).seconds();
+    // Once initialized, waiting ends after 1 s of newer scans, so a stalled
+    // /odom or TF stream degrades as before instead of stopping rf2o.
+    // Sim startup stalls both for ~0.6 s; giving up sooner seeds the next
+    // match with a bad constant-velocity guess.
+    const bool overdue = rf2o_ref.is_initialized() &&
+        (rclcpp::Time(pending_scans.back()->header.stamp) -
+         rclcpp::Time(scan->header.stamp)).seconds() > 1.0;
     OdomSample prior{};
-    if (!odom_prior_topic.empty() && !odomPriorAt(stamp, prior))
+    const bool have_prior = !odom_prior_topic.empty() && odomPriorAt(stamp, prior);
+    if (!odom_prior_topic.empty() && !have_prior)
     {
       if (!odom_prior_buf.empty() && stamp < odom_prior_buf.front().t)
       {
         pending_scans.pop_front();
         continue;  // History cannot grow backwards to cover this scan.
       }
-      return;
+      if (!overdue)
+        return;
     }
     // No timeout here: callbacks must run to supply the missing transform.
-    if (!buffer_->canTransform(base_frame_id, scan->header.frame_id,
-                              tf2_ros::fromMsg(scan->header.stamp)))
+    if (!overdue && !buffer_->canTransform(base_frame_id, scan->header.frame_id,
+                                           tf2_ros::fromMsg(scan->header.stamp)))
       return;
     last_scan = *scan;
-    if (!setLaserPoseFromTf())
+    if (!setLaserPoseFromTf(overdue) && !overdue)
       return;
     pending_scans.pop_front();
+    // A stale extrinsic hides how far a panning head turned, and matching or
+    // seeding across that swing reads it as translation. Skip the scan like a
+    // dropped one: the next fresh scan matches across the gap.
+    if (extrinsic_stale && confidence_enabled)
+    {
+      last_scan_stamp = rf2o_ref.last_odom_time;
+      publishQuality(Tier::FAILED, "extrinsic_stale", MatchQuality(),
+                     Eigen::Vector2d::Zero(), "none");
+      continue;
+    }
     rf2o_ref.current_scan_time = scan->header.stamp;
     if (rf2o_ref.first_laser_scan)
     {
@@ -220,13 +239,18 @@ void CLaserOdometry2DNode::drainPendingScans()
       process();
     }
     matched_prior = prior;
-    have_matched_prior = !odom_prior_topic.empty();
+    have_matched_prior = have_prior;
   }
 }
 
 
-// Use only the scan-time transform; the pending queue waits for coverage.
-bool CLaserOdometry2DNode::setLaserPoseFromTf()
+/**
+ * Sets rf2o's laser->base_frame_id extrinsic from TF at the scan's stamp.
+ * With allow_latest, falls back to the latest transform, stale if more than
+ * max_extrinsic_age from the scan. Returns false, keeping the last
+ * known-good transform, if no lookup succeeds.
+ */
+bool CLaserOdometry2DNode::setLaserPoseFromTf(bool allow_latest)
 {
   geometry_msgs::msg::TransformStamped tf_laser;
 
@@ -241,7 +265,23 @@ bool CLaserOdometry2DNode::setLaserPoseFromTf()
   }
   catch (tf2::TransformException &)
   {
-    return false;
+    if (!allow_latest)
+      return false;
+    try
+    {
+      tf_laser = buffer_->lookupTransform(base_frame_id, last_scan.header.frame_id,
+                                          tf2::TimePointZero);
+      extrinsic_age = std::abs((rclcpp::Time(last_scan.header.stamp) -
+                                rclcpp::Time(tf_laser.header.stamp)).seconds());
+      extrinsic_stale = extrinsic_age > max_extrinsic_age;
+    }
+    catch (tf2::TransformException &ex)
+    {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "Could not look up %s -> %s, keeping last known transform: %s",
+          base_frame_id.c_str(), last_scan.header.frame_id.c_str(), ex.what());
+      return false;
+    }
   }
 
   // Keep this transform as Eigen Matrix3d

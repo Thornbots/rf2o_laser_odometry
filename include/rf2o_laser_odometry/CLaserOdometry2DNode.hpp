@@ -26,7 +26,7 @@ public:
 
   void process();
   void publish(const Eigen::Matrix2d &position_cov);
-  bool setLaserPoseFromTf();
+  bool setLaserPoseFromTf(bool allow_latest = false);
   void warnOnSkippedScan();
 
   // Params & vars

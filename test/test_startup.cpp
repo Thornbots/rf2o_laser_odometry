@@ -24,6 +24,15 @@ protected:
     t.transform.rotation.w = 1.0;
     ASSERT_TRUE(node->buffer_->setTransform(t, "test", true));
   }
+  void tfAt(double time)
+  {
+    geometry_msgs::msg::TransformStamped t;
+    t.header.stamp = rclcpp::Time(static_cast<int64_t>(time * 1e9));
+    t.header.frame_id = "base_link";
+    t.child_frame_id = "laser";
+    t.transform.rotation.w = 1.0;
+    ASSERT_TRUE(node->buffer_->setTransform(t, "test", false));
+  }
   void odom(double time, double x)
   {
     auto msg = std::make_shared<nav_msgs::msg::Odometry>();
@@ -126,6 +135,50 @@ TEST_F(Startup, WheelFallbackSpansQueueDropsAfterHistoryExpires)
   EXPECT_TRUE(node->has_odom_prior);
   EXPECT_NEAR(node->rf2o_ref.robot_pose_.translation().x(), 3.0, 1e-6);
   EXPECT_DOUBLE_EQ(node->rf2o_ref.last_odom_time.seconds(), 4.0);
+}
+
+TEST_F(Startup, StalledOdomStopsBlockingOnceANewerScanQueues)
+{
+  odom(1.0, 0.0);
+  tf();
+  scan(1.0);
+  odom(1.1, 0.1);
+  scan(1.1);
+  EXPECT_DOUBLE_EQ(node->rf2o_ref.last_scan_time_.seconds(), 1.1);
+  scan(1.2);  // /odom stops: waits for 1 s of newer scans.
+  scan(2.2);
+  EXPECT_EQ(node->pending_scans.size(), 2u);
+  scan(2.3);
+  EXPECT_DOUBLE_EQ(node->rf2o_ref.last_scan_time_.seconds(), 1.2);
+  EXPECT_FALSE(node->has_odom_prior);
+  EXPECT_FALSE(node->have_matched_prior);
+  EXPECT_EQ(node->pending_scans.size(), 2u);
+}
+
+TEST_F(Startup, StalledTfSkipsOverdueScanAsStale)
+{
+  node->confidence_enabled = true;
+  node->max_extrinsic_age = 0.05;
+  odom(1.0, 0.0);
+  odom(2.0, 0.0);
+  tfAt(1.0);
+  scan(1.0);
+  ASSERT_TRUE(node->rf2o_ref.is_initialized());
+  scan(1.1);
+  scan(2.0);
+  EXPECT_EQ(node->pending_scans.size(), 2u);
+  scan(2.2);  // 1.1 is overdue and its latest extrinsic is 0.1 s old.
+  EXPECT_TRUE(node->extrinsic_stale);
+  EXPECT_DOUBLE_EQ(node->rf2o_ref.last_scan_time_.seconds(), 1.0);
+  EXPECT_DOUBLE_EQ(node->matched_prior.t, 1.0);
+  EXPECT_EQ(node->pending_scans.size(), 2u);
+  odom(2.5, 0.0);
+  tfAt(2.0);
+  tfAt(2.2);
+  node->drainPendingScans();
+  EXPECT_FALSE(node->extrinsic_stale);
+  EXPECT_DOUBLE_EQ(node->rf2o_ref.last_scan_time_.seconds(), 2.2);
+  EXPECT_TRUE(node->pending_scans.empty());
 }
 
 TEST_F(Startup, RejectsMalformedCustomInitUntilValidPoseArrives)
