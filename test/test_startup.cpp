@@ -194,6 +194,7 @@ TEST_F(Startup, ContinuousMultiTurnPatrolKeepsMatching)
     ASSERT_LT((xy - previous).norm(), 0.004) << i;
     ASSERT_NEAR(node->rf2o_ref.last_odom_time.seconds(), 4.5 + i * 0.05, 1e-9);
     if (!node->references.empty()) ++anchored;
+    ASSERT_LT(xy.norm(), 0.01) << i;
     previous = xy;
   }
   EXPECT_GT(anchored, 1300);
@@ -219,6 +220,7 @@ TEST_F(Startup, FullHeadSweepHasNoAnchorSwitchSteps)
     const Eigen::Vector2d xy = node->rf2o_ref.robot_pose_.translation().head<2>();
     ASSERT_LT((xy - previous).norm(), 0.004) << i;
     previous = xy;
+    ASSERT_LT(xy.norm(), 0.01) << i;
     ASSERT_LE(node->references.size(), 512u);
   }
   EXPECT_GT(node->rf2o_ref.last_odom_time.seconds(), 64.0);
