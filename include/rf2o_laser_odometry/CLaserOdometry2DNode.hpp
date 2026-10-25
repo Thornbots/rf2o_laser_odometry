@@ -21,12 +21,12 @@ namespace rf2o {
 class CLaserOdometry2DNode : public rclcpp::Node
 {
 public:
-  CLaserOdometry2DNode();
+  explicit CLaserOdometry2DNode(const rclcpp::NodeOptions &options = rclcpp::NodeOptions());
   enum class Tier { GOOD, DEGRADED, FAILED };
 
   void process();
   void publish(const Eigen::Matrix2d &position_cov);
-  bool setLaserPoseFromTf();
+  bool setLaserPoseFromTf(bool allow_latest = false);
   void warnOnSkippedScan();
 
   // Params & vars
@@ -61,6 +61,7 @@ public:
   double              max_failed_variance;    // m^2 cap
   int                 recovery_matches;       // good matches to shed it
   double              failed_extra = 0.0;     // current added variance, m^2
+  rclcpp::Time        last_failed_scan_stamp{0, 0, RCL_ROS_TIME};
   double              recovery_step = 0.0;
   bool                extrinsic_stale = false;
   double              extrinsic_age = 0.0;    // s behind the scan; -1 if lookups failed
@@ -85,6 +86,12 @@ public:
   std::deque<OdomSample>                                        odom_prior_buf;
   bool odomPriorAt(double t, OdomSample &out) const;
   bool setOdomPrior();
+  void drainPendingScans();
+  std::deque<sensor_msgs::msg::LaserScan::SharedPtr> pending_scans;
+  rclcpp::TimerBase::SharedPtr pending_timer;
+  int64_t newest_scan_stamp = -1;
+  OdomSample matched_prior{};
+  bool have_matched_prior = false;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr         odom_pub;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr quality_pub;
 
@@ -99,3 +106,4 @@ public:
   void odomPriorCallBack(const nav_msgs::msg::Odometry::SharedPtr msg);
 };
 
+}  // namespace rf2o

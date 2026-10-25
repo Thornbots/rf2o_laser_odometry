@@ -115,13 +115,11 @@ protected:
     geometry_msgs::msg::Pose origin;
     origin.orientation.w = 1.0;
     rf2o->init(roomScan(0.0), origin);
-    // The first match runs against init()'s empty pyramid; get past it.
-    match(roomScan(0.1));
+    EXPECT_TRUE(match(roomScan(0.1)));
   }
 
   bool match(const sensor_msgs::msg::LaserScan &scan)
   {
-    rf2o->current_scan_time = scan.header.stamp;
     return rf2o->odometryCalculation(scan);
   }
 
@@ -156,6 +154,146 @@ TEST_F(MatchQualityTest, VariableSizeScansAreSkippedWithoutChangingHistory)
       EXPECT_TRUE(rf2o->range[i].isApprox(history[i], 0.0f));
   }
   ASSERT_TRUE(match(roomScan(0.4)));
+  EXPECT_LT(rf2o->getMatchQuality().speed, 0.05);
+}
+
+TEST_F(MatchQualityTest, NonmonotonicStampsLeaveMatcherStateUntouched)
+{
+  ASSERT_TRUE(match(roomScan(0.2)));
+  const Pose3d pose = rf2o->getPose();
+  const Pose3d increment = rf2o->getIncrement();
+  const auto covariance = rf2o->getIncrementCovariance();
+  const auto history = rf2o->range;
+  const auto old_history = rf2o->range_old;
+  const auto input = rf2o->range_wf;
+  const auto prior = rf2o->kai_loc_old_;
+  const auto time = rf2o->current_scan_time;
+  for (double stamp : {0.2, 0.1, 0.0})
+  {
+    EXPECT_FALSE(match(roomScan(stamp)));
+    EXPECT_EQ(rf2o->getMatchQuality().failure, MatchQuality::Failure::TIMESTAMP);
+    EXPECT_EQ(rf2o->current_scan_time, time);
+    EXPECT_EQ(rf2o->last_odom_time, time);
+    EXPECT_TRUE(rf2o->getPose().isApprox(pose));
+    EXPECT_TRUE(rf2o->getIncrement().isApprox(increment));
+    EXPECT_TRUE(rf2o->getIncrementCovariance().isApprox(covariance, 0.f));
+    EXPECT_TRUE(rf2o->range_wf.isApprox(input, 0.f));
+    EXPECT_TRUE(rf2o->kai_loc_old_.isApprox(prior, 0.f));
+    for (size_t i = 0; i < history.size(); ++i)
+    {
+      EXPECT_TRUE(rf2o->range[i].isApprox(history[i], 0.f));
+      EXPECT_TRUE(rf2o->range_old[i].isApprox(old_history[i], 0.f));
+    }
+  }
+  EXPECT_TRUE(match(roomScan(0.3)));
+}
+
+TEST_F(MatchQualityTest, FailedScanStillDefinesTimestampAndPyramidReference)
+{
+  ASSERT_TRUE(match(roomScan(0.2)));
+  EXPECT_FALSE(match(roomScan(0.4, 0.0)));
+  ASSERT_EQ(rf2o->getMatchQuality().failure, MatchQuality::Failure::NO_LEVELS);
+  const auto history = rf2o->range;
+  const auto old_history = rf2o->range_old;
+  for (double stamp : {0.3, 0.4})
+  {
+    EXPECT_FALSE(match(roomScan(stamp)));
+    EXPECT_EQ(rf2o->getMatchQuality().failure, MatchQuality::Failure::TIMESTAMP);
+    EXPECT_EQ(rf2o->last_odom_time, rclcpp::Time(int64_t{200000000}, RCL_ROS_TIME));
+    EXPECT_EQ(rf2o->current_scan_time, rclcpp::Time(int64_t{400000000}, RCL_ROS_TIME));
+    for (size_t i = 0; i < history.size(); ++i)
+    {
+      EXPECT_TRUE(rf2o->range[i].isApprox(history[i], 0.f));
+      EXPECT_TRUE(rf2o->range_old[i].isApprox(old_history[i], 0.f));
+    }
+  }
+  // The blank reference consumes the next scan; the following pair recovers.
+  EXPECT_FALSE(match(roomScan(0.5)));
+  EXPECT_TRUE(match(roomScan(0.6)));
+}
+
+TEST_F(MatchQualityTest, SolversRejectSingularAndNonfiniteNormalEquations)
+{
+  ASSERT_TRUE(match(roomScan(0.2)));
+  const auto weights = rf2o->weights;
+  rf2o->weights.setZero();
+  EXPECT_FALSE(rf2o->solveSystemOneLevel());
+  EXPECT_FALSE(rf2o->solveSystemNonLinear());
+  rf2o->weights = weights;
+  rf2o->dt.setConstant(std::numeric_limits<float>::quiet_NaN());
+  EXPECT_FALSE(rf2o->solveSystemOneLevel());
+  EXPECT_FALSE(rf2o->solveSystemNonLinear());
+}
+
+TEST_F(MatchQualityTest, FilterRejectsNonfiniteIncrementsWithoutChangingTransform)
+{
+  ASSERT_TRUE(match(roomScan(0.2)));
+  rf2o->cov_odo.setIdentity();
+  rf2o->kai_loc_old_.setZero();
+  const auto transform = rf2o->transformations[rf2o->level];
+  for (float invalid : {std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::infinity()})
+  {
+    rf2o->kai_loc_level_.setZero();
+    rf2o->kai_loc_level_(0) = invalid;
+    EXPECT_FALSE(rf2o->filterLevelSolution());
+    EXPECT_TRUE(rf2o->transformations[rf2o->level].isApprox(transform, 0.f));
+  }
+}
+
+TEST_F(MatchQualityTest, FilterRejectsInvalidCovariancesWithoutChangingTransform)
+{
+  ASSERT_TRUE(match(roomScan(0.2)));
+  rf2o->kai_loc_level_.setZero();
+  rf2o->kai_loc_old_.setZero();
+  const auto transform = rf2o->transformations[rf2o->level];
+  for (int invalid = 0; invalid < 4; ++invalid)
+  {
+    rf2o->cov_odo.setIdentity();
+    if (invalid == 0) rf2o->cov_odo(0, 0) = std::numeric_limits<float>::quiet_NaN();
+    if (invalid == 1) rf2o->cov_odo(0, 0) = std::numeric_limits<float>::infinity();
+    if (invalid == 2) rf2o->cov_odo(0, 0) = -1.f;
+    if (invalid == 3) rf2o->cov_odo(0, 1) = 1.f;
+    EXPECT_FALSE(rf2o->filterLevelSolution()) << invalid;
+    EXPECT_TRUE(rf2o->transformations[rf2o->level].isApprox(transform, 0.f));
+  }
+}
+
+TEST_F(MatchQualityTest, ZeroResidualRobustSolveFailsWithoutContaminatingPose)
+{
+  const auto reference = roomScan(0.2);
+  ASSERT_TRUE(match(reference));
+  const Pose3d pose = rf2o->getPose();
+  const auto time = rf2o->last_odom_time;
+  auto identical = reference;
+  identical.header.stamp = roomScan(0.3).header.stamp;
+  EXPECT_FALSE(match(identical));
+  EXPECT_EQ(rf2o->getMatchQuality().failure, MatchQuality::Failure::EIGENSOLVER);
+  EXPECT_TRUE(rf2o->getPose().isApprox(pose));
+  EXPECT_EQ(rf2o->last_odom_time, time);
+  rf2o->deadReckon(Pose3d::Identity());
+  EXPECT_TRUE(match(roomScan(0.4)));
+}
+
+TEST_F(MatchQualityTest, NumericalFailureKeepsPoseAndRecoversThroughDeadReckoning)
+{
+  ASSERT_TRUE(match(roomScan(0.2)));
+  const Pose3d pose = rf2o->getPose();
+  const Pose3d increment = rf2o->getIncrement();
+  const auto time = rf2o->last_odom_time;
+  rf2o->kai_loc_old_(0) = std::numeric_limits<float>::quiet_NaN();
+  EXPECT_FALSE(match(roomScan(0.3)));
+  EXPECT_EQ(rf2o->getMatchQuality().failure, MatchQuality::Failure::EIGENSOLVER);
+  EXPECT_TRUE(rf2o->getPose().isApprox(pose));
+  EXPECT_TRUE(rf2o->getIncrement().isApprox(increment));
+  EXPECT_EQ(rf2o->last_odom_time, time);
+  // As in the node, advance the pose to the failed scan's retained reference.
+  rf2o->deadReckon(Pose3d::Identity());
+  EXPECT_TRUE(rf2o->getPose().isApprox(pose));
+  EXPECT_EQ(rf2o->last_odom_time, rf2o->current_scan_time);
+  ASSERT_TRUE(match(roomScan(0.4)));
+  EXPECT_TRUE(rf2o->getPose().matrix().allFinite());
+  EXPECT_TRUE(rf2o->getIncrementCovariance().allFinite());
   EXPECT_LT(rf2o->getMatchQuality().speed, 0.05);
 }
 
@@ -223,6 +361,35 @@ Pose3d swungExtrinsic(const Pose3d &extrinsic, double swing)
   return turn * extrinsic;
 }
 
+TEST_F(MatchQualityTest, DiscardedMovingHeadScanPreservesFullMatchInterval)
+{
+  rf2o->fixed_heading = true;
+  const Pose3d before = rf2o->getPose();
+  const Pose3d extrinsic = rf2o->laser_pose_on_robot_;
+  const auto history = rf2o->range;
+  const auto stamp = rf2o->last_odom_time;
+  rf2o->setLaserPose(swungExtrinsic(extrinsic, 0.1));
+  EXPECT_FALSE(match(roomScan(0.3, 0.0)));
+  rf2o->discardScan();
+  rf2o->discardScan();  // Idempotent; never swap the rejected scan back in.
+  EXPECT_EQ(rf2o->last_odom_time, stamp);
+  EXPECT_TRUE(rf2o->getPose().isApprox(before));
+  for (size_t i = 0; i < history.size(); ++i)
+    EXPECT_TRUE(rf2o->range[i].isApprox(history[i], 0.f));
+  const Pose3d head = swungExtrinsic(extrinsic, 0.15);
+  Pose3d motion = Pose3d::Identity();
+  motion.translation() << 0.04, 0.01, 0.0;
+  const Pose3d lidar = extrinsic.inverse() * motion * head;
+  rf2o->setLaserPose(head);
+  // No wheel seed: recover by matching directly to the retained scan.
+  ASSERT_TRUE(match(roomScanFrom(1.5, lidar.translation().x(), lidar.translation().y(),
+                                rf2o::getYaw(lidar.rotation()))));
+  const auto moved = rf2o->getPose().translation() - before.translation();
+  EXPECT_NEAR(moved.x(), 0.04, 0.01);
+  EXPECT_NEAR(moved.y(), 0.01, 0.01);
+  EXPECT_TRUE(rf2o->laser_pose_on_robot_prev_.isApprox(head));
+}
+
 TEST_F(MatchQualityTest, DeadReckonCarriesAHeadSwing)
 {
   rf2o->fixed_heading = true;
@@ -277,8 +444,7 @@ TEST(RealFormatScan, InitializesAndMatchesTranslation)
       rf2o.current_scan_time = scan.header.stamp;
       return rf2o.odometryCalculation(scan);
     };
-    // The first match runs against init()'s empty pyramid; get past it.
-    match(realFormatScan(0.1));  // against init()'s empty pyramid: no_levels
+    ASSERT_TRUE(match(realFormatScan(0.1)));
     ASSERT_TRUE(match(realFormatScan(0.2)));
     const MatchQuality &still = rf2o.getMatchQuality();
     EXPECT_EQ(still.failure, MatchQuality::Failure::NONE);

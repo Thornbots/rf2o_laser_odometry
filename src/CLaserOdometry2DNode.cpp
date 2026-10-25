@@ -19,7 +19,8 @@
 
 using namespace rf2o;
 
-CLaserOdometry2DNode::CLaserOdometry2DNode(): Node("CLaserOdometry2DNode")
+CLaserOdometry2DNode::CLaserOdometry2DNode(const rclcpp::NodeOptions &options)
+  : Node("CLaserOdometry2DNode", options)
 {
   RCLCPP_INFO(get_logger(), "Initializing RF2O node...");
 
@@ -124,7 +125,7 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(): Node("CLaserOdometry2DNode")
     initial_robot_pose.pose.pose.position.x = 0;
     initial_robot_pose.pose.pose.position.y = 0;
     initial_robot_pose.pose.pose.position.z = 0;
-    initial_robot_pose.pose.pose.orientation.w = 0;
+    initial_robot_pose.pose.pose.orientation.w = 1;
     initial_robot_pose.pose.pose.orientation.x = 0;
     initial_robot_pose.pose.pose.orientation.y = 0;
     initial_robot_pose.pose.pose.orientation.z = 0;
@@ -133,6 +134,8 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(): Node("CLaserOdometry2DNode")
   // Init variables
   rf2o_ref.module_initialized = false;
   rf2o_ref.first_laser_scan   = true;
+  pending_timer = create_wall_timer(std::chrono::milliseconds(10),
+      std::bind(&CLaserOdometry2DNode::drainPendingScans, this));
 }
 
 
@@ -143,43 +146,115 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(): Node("CLaserOdometry2DNode")
 */
 void CLaserOdometry2DNode::LaserCallBack(const sensor_msgs::msg::LaserScan::SharedPtr new_scan)
 {
-  if (GT_pose_initialized)
+  const int64_t stamp = rclcpp::Time(new_scan->header.stamp).nanoseconds();
+  if (stamp <= newest_scan_stamp ||
+      (rf2o_ref.is_initialized() && !rf2o_ref.acceptsScanGeometry(*new_scan)))
+    return;
+  newest_scan_stamp = stamp;
+  pending_scans.push_back(new_scan);
+  // Bound both memory and scan-time latency while prerequisites catch up.
+  while (pending_scans.size() > 100 ||
+      (rclcpp::Time(pending_scans.back()->header.stamp) -
+       rclcpp::Time(pending_scans.front()->header.stamp)).seconds() > 2.0)
   {
-    if (rf2o_ref.is_initialized() && !rf2o_ref.acceptsScanGeometry(*new_scan))
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "Pending scan queue full; dropping oldest scan");
+    pending_scans.pop_front();
+  }
+  drainPendingScans();
+}
+
+
+// The executor must remain free to receive odometry and TF while we wait.
+void CLaserOdometry2DNode::drainPendingScans()
+{
+  while (GT_pose_initialized && !pending_scans.empty())
+  {
+    const auto scan = pending_scans.front();
+    if (rf2o_ref.is_initialized() && !rf2o_ref.acceptsScanGeometry(*scan))
+    {
+      pending_scans.pop_front();
+      continue;
+    }
+    const double stamp = rclcpp::Time(scan->header.stamp).seconds();
+    // Once initialized, waiting ends after 1 s of newer scans, so a stalled
+    // /odom or TF stream degrades as before instead of stopping rf2o.
+    // Sim startup stalls both for ~0.6 s; giving up sooner seeds the next
+    // match with a bad constant-velocity guess.
+    const bool overdue = rf2o_ref.is_initialized() &&
+        (rclcpp::Time(pending_scans.back()->header.stamp) -
+         rclcpp::Time(scan->header.stamp)).seconds() > 1.0;
+    OdomSample prior{};
+    const bool have_prior = !odom_prior_topic.empty() && odomPriorAt(stamp, prior);
+    if (!odom_prior_topic.empty() && !have_prior)
+    {
+      if (!odom_prior_buf.empty() && stamp < odom_prior_buf.front().t)
+      {
+        pending_scans.pop_front();
+        continue;  // History cannot grow backwards to cover this scan.
+      }
+      if (!overdue)
+        return;
+    }
+    // No timeout here: callbacks must run to supply the missing transform.
+    if (!overdue && !buffer_->canTransform(base_frame_id, scan->header.frame_id,
+                                           tf2_ros::fromMsg(scan->header.stamp)))
       return;
-
-    last_scan = *new_scan;
-    rf2o_ref.current_scan_time = last_scan.header.stamp;
-
-    if (rf2o_ref.first_laser_scan == false)
+    last_scan = *scan;
+    if (!setLaserPoseFromTf(overdue) && !overdue)
+      return;
+    pending_scans.pop_front();
+    // A stale extrinsic hides how far a panning head turned, and matching or
+    // seeding across that swing reads it as translation. Skip the scan like a
+    // dropped one: the next fresh scan matches across the gap.
+    if (extrinsic_stale && confidence_enabled)
+    {
+      last_scan_stamp = rf2o_ref.last_odom_time;
+      publishQuality(Tier::FAILED, "extrinsic_stale", MatchQuality(),
+                     Eigen::Vector2d::Zero(), "none");
+      continue;
+    }
+    rf2o_ref.current_scan_time = scan->header.stamp;
+    if (rf2o_ref.first_laser_scan)
+    {
+      auto pose = initial_robot_pose.pose.pose;
+      // A distinct init topic remains an explicitly supplied origin.
+      if (initPose_sub && odom_prior_sub &&
+          std::string(initPose_sub->get_topic_name()) == odom_prior_sub->get_topic_name())
+      {
+        pose.position.x = prior.x;
+        pose.position.y = prior.y;
+        tf2::Quaternion yaw;
+        yaw.setRPY(0.0, 0.0, prior.yaw);
+        pose.orientation = tf2::toMsg(yaw);
+      }
+      rf2o_ref.init(last_scan, pose);
+      rf2o_ref.first_laser_scan = false;
+      last_scan_stamp = scan->header.stamp;
+      RCLCPP_INFO(get_logger(), "Initialized at scan %.9f: x=%.6f y=%.6f",
+                  stamp, pose.position.x, pose.position.y);
+    }
+    else
     {
       warnOnSkippedScan();
       process();
     }
-    else if (setLaserPoseFromTf())
+    if (rf2o_ref.last_odom_time == rclcpp::Time(scan->header.stamp))
     {
-      // Initialize module on first scan (from laser params). Only once the
-      // laser->base_frame_id transform actually resolves -- otherwise wait
-      // and retry on the next scan rather than initializing from a bogus
-      // identity transform.
-      rf2o_ref.init(last_scan, initial_robot_pose.pose.pose);
-      rf2o_ref.first_laser_scan = false;
+      matched_prior = prior;
+      have_matched_prior = have_prior;
     }
   }
 }
 
 
 /**
-   * Gets the laser pose with respect the base_link (through TF)
-   * This allow estimation of the odometry with respect to the robot base reference system.
-   * Called every scan (not just once at startup) so a non-rigid sensor
-   * mount (e.g. a lidar on a moving head joint) is tracked correctly.
-   * Looked up at the scan's stamp, falling back to the latest transform
-   * when TF hasn't reached that stamp yet. That fallback is stale only if
-   * it is more than max_extrinsic_age older than the scan. Returns false,
-   * leaving the last known-good transform in place, if both lookups fail.
-   */
-bool CLaserOdometry2DNode::setLaserPoseFromTf()
+ * Sets rf2o's laser->base_frame_id extrinsic from TF at the scan's stamp.
+ * With allow_latest, falls back to the latest transform, stale if more than
+ * max_extrinsic_age from the scan. Returns false, keeping the last
+ * known-good transform, if no lookup succeeds.
+ */
+bool CLaserOdometry2DNode::setLaserPoseFromTf(bool allow_latest)
 {
   geometry_msgs::msg::TransformStamped tf_laser;
 
@@ -192,33 +267,25 @@ bool CLaserOdometry2DNode::setLaserPoseFromTf()
     extrinsic_stale = false;
     extrinsic_age = 0.0;
   }
-  catch (tf2::ExtrapolationException &)
+  catch (tf2::TransformException &)
   {
+    if (!allow_latest)
+      return false;
     try
     {
-      tf_laser = buffer_->lookupTransform(base_frame_id, last_scan.header.frame_id, tf2::TimePointZero);
-      // Joint-driven TF usually trails the scan by a joint_states period.
+      tf_laser = buffer_->lookupTransform(base_frame_id, last_scan.header.frame_id,
+                                          tf2::TimePointZero);
       extrinsic_age = std::abs((rclcpp::Time(last_scan.header.stamp) -
                                 rclcpp::Time(tf_laser.header.stamp)).seconds());
       extrinsic_stale = extrinsic_age > max_extrinsic_age;
     }
     catch (tf2::TransformException &ex)
     {
-      RCLCPP_WARN(get_logger(), "Could not look up %s -> %s, keeping last known transform: %s",
-                  base_frame_id.c_str(), last_scan.header.frame_id.c_str(), ex.what());
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "Could not look up %s -> %s, keeping last known transform: %s",
+          base_frame_id.c_str(), last_scan.header.frame_id.c_str(), ex.what());
       return false;
     }
-  }
-  catch (tf2::TransformException &ex)
-  {
-    // Don't let a transient lookup failure overwrite the last known-good
-    // extrinsic with a garbage/identity transform -- keep using it until
-    // the next successful lookup. This matters once the laser->base_frame_id
-    // transform is re-queried every scan (not just once at startup): a
-    // momentary TF gap should degrade to "stale but valid", not corrupt.
-    RCLCPP_WARN(get_logger(), "Could not look up %s -> %s, keeping last known transform: %s",
-                base_frame_id.c_str(), last_scan.header.frame_id.c_str(), ex.what());
-    return false;
   }
 
   // Keep this transform as Eigen Matrix3d
@@ -279,23 +346,9 @@ void CLaserOdometry2DNode::process()
   if (!rf2o_ref.is_initialized())
     return;
 
-  // Refresh the laser->base_frame_id extrinsic every scan, not just once
-  // at startup -- the sensor mount isn't assumed rigid (e.g. a
-  // head-mounted lidar that pans independently of the base).
-  setLaserPoseFromTf();
-
-  // A stale extrinsic hides how far a panning head turned, and matching or
-  // seeding across that swing reads it as translation. Skip the scan like a
-  // dropped one: the next fresh scan matches across the gap.
-  if (extrinsic_stale && confidence_enabled)
-  {
-    last_scan_stamp = rf2o_ref.last_odom_time;
-    publishQuality(Tier::FAILED, "extrinsic_stale", MatchQuality(),
-                   Eigen::Vector2d::Zero(), "none");
-    return;
-  }
-
   // Replace the constant-velocity guess with measured motion, if any.
+  const MatrixS31 previous_prior = rf2o_ref.kai_loc_old_;
+  const IncrementCov previous_covariance = rf2o_ref.cov_odo;
   has_odom_prior = !odom_prior_topic.empty() && setOdomPrior();
 
   const bool solved = rf2o_ref.odometryCalculation(last_scan);
@@ -312,15 +365,17 @@ void CLaserOdometry2DNode::process()
 
   if (tier == Tier::FAILED && confidence_enabled)
   {
-    const double dt = (rf2o_ref.current_scan_time - rf2o_ref.last_odom_time).seconds();
+    const double dt = (rf2o_ref.current_scan_time -
+        std::max(rf2o_ref.last_odom_time, last_failed_scan_stamp)).seconds();
+    last_failed_scan_stamp = rf2o_ref.current_scan_time;
     failed_extra = std::min(max_failed_variance, failed_extra + failed_variance_rate * std::max(dt, 0.0));
     recovery_step = failed_extra / std::max(recovery_matches, 1);
     if (has_odom_prior)
     {
       // Discard the match (IMPLAUSIBLE_SPEED left the pose untouched too)
       // and carry the pose on wheel odometry across this scan.
-      rf2o_ref.deadReckon(odom_prior_increment);
-      increment = "odom";
+      if (rf2o_ref.deadReckon(odom_prior_increment))
+        increment = "odom";
     }
   }
   else if (tier != Tier::FAILED)
@@ -330,9 +385,12 @@ void CLaserOdometry2DNode::process()
 
   if (std::strcmp(increment, "none") == 0)
   {
-    // Nothing moved the pose. Skip this scan's motion rather than let the
-    // next match span two scans with one scan's prior.
-    rf2o_ref.last_odom_time = rf2o_ref.current_scan_time;
+    // Keep the pyramid, pose, head reference and wheel reference coherent.
+    // The next attempt spans the entire unaccepted interval.
+    rf2o_ref.discardScan();
+    rf2o_ref.kai_loc_old_ = previous_prior;
+    rf2o_ref.cov_odo = previous_covariance;
+    last_scan_stamp = rf2o_ref.last_odom_time;
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
       "Scan match failed (%s), not publishing", reason.c_str());
     publishQuality(tier, reason, q, sigma, increment);
@@ -451,27 +509,30 @@ void CLaserOdometry2DNode::odomPriorCallBack(const nav_msgs::msg::Odometry::Shar
   s.x = msg->pose.pose.position.x;
   s.y = msg->pose.pose.position.y;
   s.yaw = tf2::getYaw(msg->pose.pose.orientation);
+  if (!std::isfinite(s.t) || !std::isfinite(s.x) ||
+      !std::isfinite(s.y) || !std::isfinite(s.yaw))
+    return;
   if (!odom_prior_buf.empty())
   {
     if (s.t == odom_prior_buf.back().t)
       return;  // duplicate stamp
     if (s.t < odom_prior_buf.back().t)
-      odom_prior_buf.clear();  // time went backwards (sim reset): start over
+      return;  // Reject reordered data without changing the reference history.
   }
   odom_prior_buf.push_back(s);
   while (odom_prior_buf.size() > 2 && odom_prior_buf.back().t - odom_prior_buf.front().t > 2.0)
     odom_prior_buf.pop_front();
+  drainPendingScans();
 }
 
 
 /**
- * Odom pose at time t, linearly interpolated; false if t is outside the
- * buffer by more than 50 ms.
+ * Odom pose at time t, linearly interpolated only within covered history.
  */
 bool CLaserOdometry2DNode::odomPriorAt(double t, OdomSample &out) const
 {
-  if (odom_prior_buf.empty() || t < odom_prior_buf.front().t - 0.05 ||
-      t > odom_prior_buf.back().t + 0.05)
+  if (odom_prior_buf.empty() || t < odom_prior_buf.front().t ||
+      t > odom_prior_buf.back().t)
     return false;
   if (t <= odom_prior_buf.front().t) { out = odom_prior_buf.front(); return true; }
   if (t >= odom_prior_buf.back().t) { out = odom_prior_buf.back(); return true; }
@@ -485,7 +546,7 @@ bool CLaserOdometry2DNode::odomPriorAt(double t, OdomSample &out) const
       out.x = a.x + k * (b.x - a.x);
       out.y = a.y + k * (b.y - a.y);
       out.yaw = a.yaw + k * std::remainder(b.yaw - a.yaw, 2.0 * M_PI);
-      return true;
+      return std::isfinite(out.x) && std::isfinite(out.y) && std::isfinite(out.yaw);
     }
   }
   return false;
@@ -500,8 +561,8 @@ bool CLaserOdometry2DNode::odomPriorAt(double t, OdomSample &out) const
  */
 bool CLaserOdometry2DNode::setOdomPrior()
 {
-  OdomSample p0, p1;
-  if (!odomPriorAt(rf2o_ref.last_odom_time.seconds(), p0) ||
+  OdomSample p0 = matched_prior, p1;
+  if (!have_matched_prior ||
       !odomPriorAt(rf2o_ref.current_scan_time.seconds(), p1))
   {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -520,12 +581,15 @@ bool CLaserOdometry2DNode::setOdomPrior()
   Pose3d robot_inc = Pose3d::Identity();
   robot_inc.linear() = rf2o::matrixYaw(std::remainder(p1.yaw - p0.yaw, 2.0 * M_PI));
   robot_inc.translation() << c * dx + s * dy, -s * dx + c * dy, 0.0;
-  odom_prior_increment = robot_inc;
   const Pose3d laser_inc = rf2o_ref.laserIncrement(robot_inc);
 
-  rf2o_ref.kai_loc_old_(0) = laser_inc.translation()(0);
-  rf2o_ref.kai_loc_old_(1) = laser_inc.translation()(1);
-  rf2o_ref.kai_loc_old_(2) = rf2o::getYaw(laser_inc.rotation());
+  MatrixS31 prior;
+  prior << laser_inc.translation()(0), laser_inc.translation()(1),
+      rf2o::getYaw(laser_inc.rotation());
+  if (!robot_inc.matrix().allFinite() || !laser_inc.matrix().allFinite() || !prior.allFinite())
+    return false;
+  odom_prior_increment = robot_inc;
+  rf2o_ref.kai_loc_old_ = prior;
   return true;
 }
 
@@ -540,8 +604,17 @@ void CLaserOdometry2DNode::initPoseCallBack(const nav_msgs::msg::Odometry::Share
   // Initialize module on first GT pose. Else do Nothing!
   if (!GT_pose_initialized)
   {
+    const auto &pose = new_initPose->pose.pose;
+    tf2::Quaternion q;
+    tf2::fromMsg(pose.orientation, q);
+    const double norm = q.length2();
+    if (!std::isfinite(pose.position.x) || !std::isfinite(pose.position.y) ||
+        !std::isfinite(pose.position.z) || !std::isfinite(norm) || norm <= 0.0)
+      return;
     initial_robot_pose = *new_initPose;
+    initial_robot_pose.pose.pose.orientation = tf2::toMsg(q.normalized());
     GT_pose_initialized = true;
+    drainPendingScans();
   }
 }
 
@@ -624,12 +697,13 @@ void CLaserOdometry2DNode::publish(const Eigen::Matrix2d &position_cov)
   }
 }
 
-} /* namespace rf2o */
+
 
 
 //-----------------------------------------------------------------------------------
 //                                   MAIN
 //-----------------------------------------------------------------------------------
+#ifndef RF2O_NODE_TEST
 int main(int argc, char** argv)
 {
   rclcpp::init(argc, argv);
@@ -639,3 +713,5 @@ int main(int argc, char** argv)
 
   return 0;
 }
+
+#endif

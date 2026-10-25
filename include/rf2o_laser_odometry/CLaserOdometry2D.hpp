@@ -73,7 +73,7 @@ using IncrementCov = Eigen::Matrix<Scalar, 3, 3>;
 // evidence only. Filled on every call, success or not.
 struct MatchQuality
 {
-  enum class Failure { NONE, NO_LEVELS, FEW_POINTS, EIGENSOLVER, IMPLAUSIBLE_SPEED, GEOMETRY };
+  enum class Failure { NONE, NO_LEVELS, FEW_POINTS, EIGENSOLVER, IMPLAUSIBLE_SPEED, GEOMETRY, TIMESTAMP };
   Failure failure = Failure::NONE;
   unsigned int levels_solved = 0;
   bool finest_level_solved = false;
@@ -118,7 +118,11 @@ public:
 
   // Advance the pose by a robot-frame increment in place of a scan match,
   // e.g. wheel odometry's motion across a scan the matcher failed on.
-  void deadReckon(const Pose3d& robot_increment);
+  bool deadReckon(const Pose3d& robot_increment);
+
+  // Discard a candidate that neither matching nor wheel fallback advanced.
+  void discardScan();
+  bool pending_scan_ = false;
 
   // A match whose robot translation over the scan gap exceeds this is
   // rejected as IMPLAUSIBLE_SPEED. 0 disables the check.
@@ -211,11 +215,13 @@ public:
   void computeNormals();
   void computeWeights();
   void findNullPoints();
-  void solveSystemOneLevel();
-  void solveSystemNonLinear();
+  bool solveSystemOneLevel();
+  bool solveSystemNonLinear();
   bool filterLevelSolution();
   void PoseUpdate(const Eigen::Matrix3f& acu_trans);
   MatchQuality quality_;
+  // High-water mark of attempted inputs, independent of the accepted reference.
+  rclcpp::Time last_scan_time_;
   void Reset(const Pose3d& ini_pose/*, CObservation2DRangeScan scan*/);
 };
 
