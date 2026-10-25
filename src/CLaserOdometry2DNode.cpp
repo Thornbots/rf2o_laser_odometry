@@ -219,7 +219,8 @@ void CLaserOdometry2DNode::drainPendingScans()
     {
       auto pose = initial_robot_pose.pose.pose;
       // A distinct init topic remains an explicitly supplied origin.
-      if (!odom_prior_topic.empty() && init_pose_from_topic == odom_prior_topic)
+      if (initPose_sub && odom_prior_sub &&
+          std::string(initPose_sub->get_topic_name()) == odom_prior_sub->get_topic_name())
       {
         pose.position.x = prior.x;
         pose.position.y = prior.y;
@@ -238,8 +239,11 @@ void CLaserOdometry2DNode::drainPendingScans()
       warnOnSkippedScan();
       process();
     }
-    matched_prior = prior;
-    have_matched_prior = have_prior;
+    if (rf2o_ref.last_odom_time == rclcpp::Time(scan->header.stamp))
+    {
+      matched_prior = prior;
+      have_matched_prior = have_prior;
+    }
   }
 }
 
@@ -343,6 +347,8 @@ void CLaserOdometry2DNode::process()
     return;
 
   // Replace the constant-velocity guess with measured motion, if any.
+  const MatrixS31 previous_prior = rf2o_ref.kai_loc_old_;
+  const IncrementCov previous_covariance = rf2o_ref.cov_odo;
   has_odom_prior = !odom_prior_topic.empty() && setOdomPrior();
 
   const bool solved = rf2o_ref.odometryCalculation(last_scan);
@@ -359,7 +365,9 @@ void CLaserOdometry2DNode::process()
 
   if (tier == Tier::FAILED && confidence_enabled)
   {
-    const double dt = (rf2o_ref.current_scan_time - rf2o_ref.last_odom_time).seconds();
+    const double dt = (rf2o_ref.current_scan_time -
+        std::max(rf2o_ref.last_odom_time, last_failed_scan_stamp)).seconds();
+    last_failed_scan_stamp = rf2o_ref.current_scan_time;
     failed_extra = std::min(max_failed_variance, failed_extra + failed_variance_rate * std::max(dt, 0.0));
     recovery_step = failed_extra / std::max(recovery_matches, 1);
     if (has_odom_prior)
@@ -377,9 +385,12 @@ void CLaserOdometry2DNode::process()
 
   if (std::strcmp(increment, "none") == 0)
   {
-    // Nothing moved the pose. Skip this scan's motion rather than let the
-    // next match span two scans with one scan's prior.
-    rf2o_ref.last_odom_time = rf2o_ref.current_scan_time;
+    // Keep the pyramid, pose, head reference and wheel reference coherent.
+    // The next attempt spans the entire unaccepted interval.
+    rf2o_ref.discardScan();
+    rf2o_ref.kai_loc_old_ = previous_prior;
+    rf2o_ref.cov_odo = previous_covariance;
+    last_scan_stamp = rf2o_ref.last_odom_time;
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
       "Scan match failed (%s), not publishing", reason.c_str());
     publishQuality(tier, reason, q, sigma, increment);

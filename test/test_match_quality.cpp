@@ -115,8 +115,7 @@ protected:
     geometry_msgs::msg::Pose origin;
     origin.orientation.w = 1.0;
     rf2o->init(roomScan(0.0), origin);
-    // The first match runs against init()'s empty pyramid; get past it.
-    match(roomScan(0.1));
+    EXPECT_TRUE(match(roomScan(0.1)));
   }
 
   bool match(const sensor_msgs::msg::LaserScan &scan)
@@ -362,6 +361,35 @@ Pose3d swungExtrinsic(const Pose3d &extrinsic, double swing)
   return turn * extrinsic;
 }
 
+TEST_F(MatchQualityTest, DiscardedMovingHeadScanPreservesFullMatchInterval)
+{
+  rf2o->fixed_heading = true;
+  const Pose3d before = rf2o->getPose();
+  const Pose3d extrinsic = rf2o->laser_pose_on_robot_;
+  const auto history = rf2o->range;
+  const auto stamp = rf2o->last_odom_time;
+  rf2o->setLaserPose(swungExtrinsic(extrinsic, 0.1));
+  EXPECT_FALSE(match(roomScan(0.3, 0.0)));
+  rf2o->discardScan();
+  rf2o->discardScan();  // Idempotent; never swap the rejected scan back in.
+  EXPECT_EQ(rf2o->last_odom_time, stamp);
+  EXPECT_TRUE(rf2o->getPose().isApprox(before));
+  for (size_t i = 0; i < history.size(); ++i)
+    EXPECT_TRUE(rf2o->range[i].isApprox(history[i], 0.f));
+  const Pose3d head = swungExtrinsic(extrinsic, 0.15);
+  Pose3d motion = Pose3d::Identity();
+  motion.translation() << 0.04, 0.01, 0.0;
+  const Pose3d lidar = extrinsic.inverse() * motion * head;
+  rf2o->setLaserPose(head);
+  // No wheel seed: recover by matching directly to the retained scan.
+  ASSERT_TRUE(match(roomScanFrom(1.5, lidar.translation().x(), lidar.translation().y(),
+                                rf2o::getYaw(lidar.rotation()))));
+  const auto moved = rf2o->getPose().translation() - before.translation();
+  EXPECT_NEAR(moved.x(), 0.04, 0.01);
+  EXPECT_NEAR(moved.y(), 0.01, 0.01);
+  EXPECT_TRUE(rf2o->laser_pose_on_robot_prev_.isApprox(head));
+}
+
 TEST_F(MatchQualityTest, DeadReckonCarriesAHeadSwing)
 {
   rf2o->fixed_heading = true;
@@ -416,8 +444,7 @@ TEST(RealFormatScan, InitializesAndMatchesTranslation)
       rf2o.current_scan_time = scan.header.stamp;
       return rf2o.odometryCalculation(scan);
     };
-    // The first match runs against init()'s empty pyramid; get past it.
-    match(realFormatScan(0.1));  // against init()'s empty pyramid: no_levels
+    ASSERT_TRUE(match(realFormatScan(0.1)));
     ASSERT_TRUE(match(realFormatScan(0.2)));
     const MatchQuality &still = rf2o.getMatchQuality();
     EXPECT_EQ(still.failure, MatchQuality::Failure::NONE);

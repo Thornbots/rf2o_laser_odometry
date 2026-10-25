@@ -24,13 +24,17 @@ protected:
     t.transform.rotation.w = 1.0;
     ASSERT_TRUE(node->buffer_->setTransform(t, "test", true));
   }
-  void tfAt(double time)
+  void tfAt(double time, double yaw = 0.0)
   {
     geometry_msgs::msg::TransformStamped t;
     t.header.stamp = rclcpp::Time(static_cast<int64_t>(time * 1e9));
     t.header.frame_id = "base_link";
     t.child_frame_id = "laser";
-    t.transform.rotation.w = 1.0;
+    tf2::Quaternion q;
+    q.setRPY(0.0, 0.0, yaw);
+    t.transform.rotation = tf2::toMsg(q);
+    t.transform.translation.x = 0.22 * std::cos(yaw);
+    t.transform.translation.y = 0.22 * std::sin(yaw);
     ASSERT_TRUE(node->buffer_->setTransform(t, "test", false));
   }
   void odom(double time, double x)
@@ -86,7 +90,10 @@ TEST_F(Startup, NeverHoldsOdomEndpoint)
 
 TEST_F(Startup, CustomInitKeepsExplicitOrigin)
 {
-  node->init_pose_from_topic = "/custom_origin";
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({{"init_pose_from_topic", "/custom_origin"},
+                               {"odom_prior_topic", "/odom"}});
+  node = std::make_unique<rf2o::CLaserOdometry2DNode>(options);
   odom(1.0, 7.0);
   odom(2.0, 8.0);
   tf();
@@ -139,6 +146,7 @@ TEST_F(Startup, WheelFallbackSpansQueueDropsAfterHistoryExpires)
 
 TEST_F(Startup, StalledOdomStopsBlockingOnceANewerScanQueues)
 {
+  node->confidence_enabled = true;
   odom(1.0, 0.0);
   tf();
   scan(1.0);
@@ -151,8 +159,73 @@ TEST_F(Startup, StalledOdomStopsBlockingOnceANewerScanQueues)
   scan(2.3);
   EXPECT_DOUBLE_EQ(node->rf2o_ref.last_scan_time_.seconds(), 1.2);
   EXPECT_FALSE(node->has_odom_prior);
-  EXPECT_FALSE(node->have_matched_prior);
+  EXPECT_TRUE(node->have_matched_prior);
+  EXPECT_DOUBLE_EQ(node->matched_prior.t, 1.1);
+  EXPECT_DOUBLE_EQ(node->rf2o_ref.last_odom_time.seconds(), 1.1);
   EXPECT_EQ(node->pending_scans.size(), 2u);
+}
+
+TEST_F(Startup, ResolvedTopicsSeedAtScanTime)
+{
+  for (const auto &args : std::vector<std::vector<std::string>>{
+      {}, {"--ros-args", "-r", "__ns:=/robot"},
+      {"--ros-args", "-r", "origin:=/wheel", "-r", "/odom:=/wheel"}})
+  {
+    rclcpp::NodeOptions options;
+    options.arguments(args);
+    options.parameter_overrides({{"init_pose_from_topic", args.size() > 4 ? "origin" : "odom"},
+                                 {"odom_prior_topic", args.size() == 3 ? "/robot/odom" : "/odom"}});
+    node = std::make_unique<rf2o::CLaserOdometry2DNode>(options);
+    EXPECT_STREQ(node->initPose_sub->get_topic_name(), node->odom_prior_sub->get_topic_name());
+    odom(1.0, 7.0);
+    odom(2.0, 8.0);
+    tf();
+    scan(1.5);
+    ASSERT_TRUE(node->rf2o_ref.is_initialized());
+    EXPECT_NEAR(node->rf2o_ref.robot_pose_.translation().x(), 7.5, 1e-9);
+  }
+}
+
+TEST_F(Startup, MovingHeadTimeoutFailureRetainsReferenceAndRecoversFullDisplacement)
+{
+  node->confidence_enabled = true;
+  node->rf2o_ref.fixed_heading = true;
+  odom(1.0, 0.0);
+  tfAt(1.0, 0.2);
+  tfAt(2.5, 0.8);
+  scan(1.0);
+  const auto pyramid = node->rf2o_ref.range;
+  const auto pose = node->rf2o_ref.laser_pose_;
+  const auto head = node->rf2o_ref.laser_pose_on_robot_prev_;
+  scan(1.1);
+  // Force NO_LEVELS while the base/head move and odometry is stalled.
+  node->pending_scans.back()->ranges.assign(720, std::numeric_limits<float>::infinity());
+  scan(1.2);
+  node->pending_scans.back()->ranges.assign(720, std::numeric_limits<float>::infinity());
+  scan(2.2);
+  EXPECT_FALSE(node->has_odom_prior);
+  EXPECT_EQ(node->rf2o_ref.getMatchQuality().failure, rf2o::MatchQuality::Failure::NO_LEVELS);
+  EXPECT_TRUE(node->have_matched_prior);
+  EXPECT_DOUBLE_EQ(node->matched_prior.t, 1.0);
+  EXPECT_DOUBLE_EQ(node->rf2o_ref.last_odom_time.seconds(), 1.0);
+  EXPECT_TRUE(node->rf2o_ref.laser_pose_.isApprox(pose));
+  EXPECT_TRUE(node->rf2o_ref.laser_pose_on_robot_prev_.isApprox(head));
+  for (size_t i = 0; i < pyramid.size(); ++i)
+    EXPECT_TRUE(node->rf2o_ref.range[i].isApprox(pyramid[i], 0.0f));
+  scan(2.3);
+  EXPECT_DOUBLE_EQ(node->rf2o_ref.last_odom_time.seconds(), 1.0);
+  EXPECT_DOUBLE_EQ(node->matched_prior.t, 1.0);
+  EXPECT_NEAR(node->failed_extra, 0.2 * node->failed_variance_rate, 1e-9);
+  // Another failure must retain the same reference, including after history expires.
+  node->pending_scans.front()->ranges.assign(720, std::numeric_limits<float>::infinity());
+  scan(2.5);
+  node->pending_scans.back()->ranges.assign(720, std::numeric_limits<float>::infinity());
+  odom(2.5, 0.3);
+  EXPECT_TRUE(node->pending_scans.empty());
+  EXPECT_NEAR(node->rf2o_ref.robot_pose_.translation().x(), 0.3, 1e-6);
+  EXPECT_NEAR(node->rf2o_ref.robot_pose_.translation().y(), 0.0, 1e-6);
+  EXPECT_DOUBLE_EQ(node->rf2o_ref.last_odom_time.seconds(), 2.5);
+  EXPECT_TRUE(node->rf2o_ref.laser_pose_on_robot_prev_.isApprox(node->rf2o_ref.laser_pose_on_robot_));
 }
 
 TEST_F(Startup, StalledTfSkipsOverdueScanAsStale)

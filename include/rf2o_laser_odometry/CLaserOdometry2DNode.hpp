@@ -61,6 +61,7 @@ public:
   double              max_failed_variance;    // m^2 cap
   int                 recovery_matches;       // good matches to shed it
   double              failed_extra = 0.0;     // current added variance, m^2
+  rclcpp::Time        last_failed_scan_stamp{0, 0, RCL_ROS_TIME};
   double              recovery_step = 0.0;
   bool                extrinsic_stale = false;
   double              extrinsic_age = 0.0;    // s behind the scan; -1 if lookups failed

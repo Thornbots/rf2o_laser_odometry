@@ -200,6 +200,9 @@ void CLaserOdometry2D::init(const sensor_msgs::msg::LaserScan& scan,
   last_odom_time = scan.header.stamp;   // the time of this first scan
   last_scan_time_ = last_odom_time;
   current_scan_time = last_odom_time;
+  range_wf = Eigen::Map<const Eigen::MatrixXf>(scan.ranges.data(), width, 1);
+  createImagePyramid();
+  pending_scan_ = false;
 }
 
 
@@ -278,6 +281,7 @@ bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& sc
 
   // Create pyramid from current scan
   createImagePyramid();
+  pending_scan_ = true;
 
   // Coarse-to-fine scheme (pyramid lvls)
   for (unsigned int i=0; i<ctf_levels; i++)
@@ -408,6 +412,17 @@ bool CLaserOdometry2D::odometryCalculation(const sensor_msgs::msg::LaserScan& sc
   return true;
 }
 
+
+void CLaserOdometry2D::discardScan()
+{
+  if (!pending_scan_)
+    return;
+  range.swap(range_old);
+  xx.swap(xx_old);
+  yy.swap(yy_old);
+  setLaserPose(laser_pose_on_robot_prev_);
+  pending_scan_ = false;
+}
 
 bool CLaserOdometry2D::deadReckon(const Pose3d& robot_increment)
 {
@@ -1090,6 +1105,7 @@ bool CLaserOdometry2D::filterLevelSolution()
 */
 void CLaserOdometry2D::PoseUpdate(const Eigen::Matrix3f& acu_trans)
 {
+  pending_scan_ = false;
   //				Compute kai_loc and kai_abs
   //--------------------------------------------------------
   kai_loc_(0) = fps*acu_trans(0,2);

@@ -18,8 +18,9 @@ For a full description of the algorithm, please refer to: **Planar Odometry from
 ## Scan-time startup
 
 When `init_pose_from_topic` and `odom_prior_topic` name the same nonempty
-odometry topic, the first accepted scan initializes from its interpolated
-odometry pose at that scan's stamp. A distinct init topic keeps its first
+odometry topic after ROS namespace resolution and remapping, the first
+accepted scan initializes from its interpolated odometry pose at that scan's
+stamp. A distinct init topic keeps its first
 latched pose as the explicit origin; an empty init topic starts at zero.
 
 Scans wait in arrival order for scan-time TF and, when configured, odometry
@@ -34,3 +35,8 @@ Odometry endpoints are never held beyond their stamps. The previous matched
 odometry pose is retained for fallback across a dropped-scan gap. Duplicate
 and backward scan/odometry stamps are ignored; restart the node after a clock
 reset. Invalid solves and covariances fail before updating the pose.
+
+Initialization builds the first scan's pyramid. If a later match fails and
+wheel fallback cannot advance the pose, its candidate pyramid is discarded.
+The accepted pose, scan, head extrinsic, timestamp and cached odometry pose
+remain together; recovery spans the full interval from that reference.
