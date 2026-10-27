@@ -73,7 +73,7 @@ using IncrementCov = Eigen::Matrix<Scalar, 3, 3>;
 // evidence only. Filled on every call, success or not.
 struct MatchQuality
 {
-  enum class Failure { NONE, NO_LEVELS, FEW_POINTS, EIGENSOLVER, IMPLAUSIBLE_SPEED };
+  enum class Failure { NONE, NO_LEVELS, FEW_POINTS, EIGENSOLVER, IMPLAUSIBLE_SPEED, GEOMETRY, TIMESTAMP };
   Failure failure = Failure::NONE;
   unsigned int levels_solved = 0;
   bool finest_level_solved = false;
@@ -87,6 +87,16 @@ struct MatchQuality
 
 const char* failureName(MatchQuality::Failure f);
 
+// A matched scan kept so later scans from nearly the same laser pose match
+// against it instead of the scan before them; see the node's reference_scans.
+struct ReferenceScan
+{
+  std::vector<Eigen::MatrixXf> range, xx, yy;  // its pyramid
+  Pose3d laser_pose;           // odom frame, as matched
+  Pose3d laser_pose_on_robot;  // extrinsic at its stamp
+  rclcpp::Time stamp;
+};
+
 
 class CLaserOdometry2D: public rclcpp::Node
 {
@@ -99,9 +109,22 @@ public:
 
   bool is_initialized();
 
-  bool odometryCalculation(const sensor_msgs::msg::LaserScan& scan);
+  // Reject changes to the initialized angular grid before touching matcher state.
+  bool acceptsScanGeometry(const sensor_msgs::msg::LaserScan& scan);
+
+  // Match scan against ref, or the previous scan if null. A failed match
+  // against ref leaves the pose where the previous scan put it.
+  bool odometryCalculation(const sensor_msgs::msg::LaserScan& scan,
+                           const ReferenceScan* ref = nullptr);
+
+  // The last matched scan, as a reference for later scans.
+  ReferenceScan currentReference() const;
 
   void setLaserPose(const Pose3d& laser_pose);
+
+  // Laser motion since laser_pose_ for a robot increment, across any
+  // extrinsic change (a panning head) since that pose was built.
+  Pose3d laserIncrement(const Pose3d& robot_increment) const;
 
   const Pose3d& getIncrement() const;
 
@@ -111,7 +134,11 @@ public:
 
   // Advance the pose by a robot-frame increment in place of a scan match,
   // e.g. wheel odometry's motion across a scan the matcher failed on.
-  void deadReckon(const Pose3d& robot_increment);
+  bool deadReckon(const Pose3d& robot_increment);
+
+  // Discard a candidate that neither matching nor wheel fallback advanced.
+  void discardScan();
+  bool pending_scan_ = false;
 
   // A match whose robot translation over the scan gap exceeds this is
   // rejected as IMPLAUSIBLE_SPEED. 0 disables the check.
@@ -160,13 +187,16 @@ public:
   unsigned int cols;
   unsigned int cols_i;
   unsigned int width;
+  float scan_angle_min_ = 0.0f;
+  float scan_angle_increment_ = 0.0f;
+  float scan_angle_max_ = 0.0f;
   unsigned int ctf_levels;
   unsigned int image_level, level;
   unsigned int num_valid_range;
   unsigned int iter_irls;
   float g_mask[5];
 
-  double lin_speed, ang_speed;
+  double lin_speed = 0.0, lat_speed = 0.0, ang_speed = 0.0;
 
   //rclcpp::wall	m_runtime;
 
@@ -178,6 +208,7 @@ public:
   Pose3d last_increment_;
   Pose3d laser_pose_on_robot_;
   Pose3d laser_pose_on_robot_inv_;
+  Pose3d laser_pose_on_robot_prev_;  // extrinsic laser_pose_ was built with
   Pose3d laser_pose_;
   Pose3d laser_oldpose_;
   Pose3d robot_pose_;
@@ -193,6 +224,8 @@ public:
   std::vector<double> last_m_ang_speeds;
 
   // Methods
+  bool match(const sensor_msgs::msg::LaserScan& scan);
+  const ReferenceScan* reference_ = nullptr;
   void createImagePyramid();
   void calculateCoord();
   void performWarping();
@@ -200,11 +233,13 @@ public:
   void computeNormals();
   void computeWeights();
   void findNullPoints();
-  void solveSystemOneLevel();
-  void solveSystemNonLinear();
+  bool solveSystemOneLevel();
+  bool solveSystemNonLinear();
   bool filterLevelSolution();
   void PoseUpdate(const Eigen::Matrix3f& acu_trans);
   MatchQuality quality_;
+  // High-water mark of attempted inputs, independent of the accepted reference.
+  rclcpp::Time last_scan_time_;
   void Reset(const Pose3d& ini_pose/*, CObservation2DRangeScan scan*/);
 };
 
