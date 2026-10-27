@@ -117,6 +117,7 @@ void CLaserOdometry2D::init(const sensor_msgs::msg::LaserScan& scan,
   robot_initial_pose_ = robot_initial_pose;
   robot_pose_ = robot_initial_pose;
   robot_oldpose_ = robot_initial_pose;
+  published_robot_pose_ = robot_initial_pose;
   lin_speed = 0.0;
   ang_speed = 0.0;
   laser_oldpose_ = laser_pose_;
@@ -337,6 +338,18 @@ bool CLaserOdometry2D::match(const sensor_msgs::msg::LaserScan& scan)
   }
 
   // Coarse-to-fine scheme (pyramid lvls)
+  // An anchored head offset is known geometry, potentially a large turn.
+  // Warp it out before solving small residual motion, including at level 0.
+  initial_warp_.setIdentity();
+  if (reference_)
+  {
+    const float yaw = kai_loc_old_(2) / fps;
+    initial_warp_(0, 0) = initial_warp_(1, 1) = std::cos(yaw);
+    initial_warp_(0, 1) = -std::sin(yaw);
+    initial_warp_(1, 0) = std::sin(yaw);
+    initial_warp_(0, 2) = kai_loc_old_(0) / fps;
+    initial_warp_(1, 2) = kai_loc_old_(1) / fps;
+  }
   for (unsigned int i=0; i<ctf_levels; i++)
   {
     // Clear previous computations
@@ -349,7 +362,7 @@ bool CLaserOdometry2D::match(const sensor_msgs::msg::LaserScan& scan)
     image_level = ctf_levels - i + std::round(std::log2(std::round(float(width)/float(cols)))) - 1;
 
     // 1. Perform warping
-    if (i == 0)
+    if (i == 0 && !reference_)
     {
       // No need for the first lvl
       range_warped[image_level] = range[image_level];
@@ -421,7 +434,7 @@ bool CLaserOdometry2D::match(const sensor_msgs::msg::LaserScan& scan)
   }
 
   Eigen::Matrix3f acu_trans;
-  acu_trans.setIdentity();
+  acu_trans = initial_warp_;
   for (unsigned int i=1; i<=ctf_levels; i++)
     acu_trans = transformations[i-1]*acu_trans;
 
@@ -994,7 +1007,7 @@ void CLaserOdometry2D::performWarping()
 {
   Eigen::Matrix3f acu_trans;
 
-  acu_trans.setIdentity();
+  acu_trans = initial_warp_;
   for (unsigned int i=1; i<=level; i++)
     acu_trans = transformations[i-1]*acu_trans;
 
@@ -1034,11 +1047,13 @@ void CLaserOdometry2D::performWarping()
         }
         else
         {
-          const float w_r = delta_l*delta_l;
+          // Anchored subpixel motion needs linear interpolation; squared
+          // weights bias repeated short translations before reanchoring.
+          const float w_r = reference_ ? delta_l : delta_l*delta_l;
           range_warped[image_level](uwarp_r) += w_r*range_w;
           wacu(uwarp_r) += w_r;
 
-          const float w_l = delta_r*delta_r;
+          const float w_l = reference_ ? delta_r : delta_r*delta_r;
           range_warped[image_level](uwarp_l) += w_l*range_w;
           wacu(uwarp_l) += w_l;
         }
@@ -1100,14 +1115,24 @@ bool CLaserOdometry2D::filterLevelSolution()
 
   //Important: we have to substract the solutions from previous levels
   Eigen::Matrix3f acu_trans;
-  acu_trans.setIdentity();
+  acu_trans = initial_warp_;
   for (unsigned int i=0; i<level; i++)
     acu_trans = transformations[i]*acu_trans;
 
-  kai_loc_sub(0) = -fps*acu_trans(0,2);
-  kai_loc_sub(1) = -fps*acu_trans(1,2);
-  kai_loc_sub(2) = -fps*std::atan2(acu_trans(1,0), acu_trans(0,0));
-  kai_loc_sub += kai_loc_old_;
+  if (reference_)
+  {
+    // Corrections multiply on the left: the remaining prior is P * A^-1.
+    const Eigen::Matrix3f residual = initial_warp_ * acu_trans.inverse();
+    kai_loc_sub << fps * residual(0, 2), fps * residual(1, 2),
+        fps * std::atan2(residual(1, 0), residual(0, 0));
+  }
+  else
+  {
+    kai_loc_sub(0) = -fps*acu_trans(0,2);
+    kai_loc_sub(1) = -fps*acu_trans(1,2);
+    kai_loc_sub(2) = -fps*std::atan2(acu_trans(1,0), acu_trans(0,0));
+    kai_loc_sub += kai_loc_old_;
+  }
   if (!acu_trans.allFinite() || !kai_loc_sub.allFinite())
     return false;
 
@@ -1217,16 +1242,27 @@ void CLaserOdometry2D::PoseUpdate(const Eigen::Matrix3f& acu_trans)
 
   // Compose Transformations (robot odom)
   robot_pose_ = laser_pose_ * laser_pose_on_robot_inv_;
+  const Pose3d previous_output = published_robot_pose_;
+  published_robot_pose_ = robot_pose_;
+  // Tuned for parked-head rebinning/occlusion noise: 8 mm threshold and
+  // equal weights give one scan of output lag at low constant speed.
+  // Raw poses must seed the chain and anchors without this lag.
+  constexpr double small_increment_m = 0.008;
+  constexpr double output_weight = 0.5;
+  if (reference_ && (robot_pose_.translation() - robot_oldpose_.translation()).head<2>().norm() <
+      small_increment_m)
+    published_robot_pose_.translation() = output_weight * robot_pose_.translation() +
+        (1.0 - output_weight) * previous_output.translation();
 
   RCLCPP_DEBUG(get_logger(), "Robot-base odom [x,y,yaw]=[%f %f %f]",
                 robot_pose_.translation()(0),
                 robot_pose_.translation()(1),
                 rf2o::getYaw(robot_pose_.rotation()));
 
-  // Twist spans consecutive accepted robot poses, regardless of the scan anchor.
+  // Twist spans consecutive published poses, regardless of the scan anchor.
   const double time_inc_sec = (current_scan_time - last_odom_time).seconds();
-  const Eigen::Vector3d velocity = robot_pose_.linear().transpose() *
-      (robot_pose_.translation() - robot_oldpose_.translation()) / time_inc_sec;
+  const Eigen::Vector3d velocity = published_robot_pose_.linear().transpose() *
+      (published_robot_pose_.translation() - previous_output.translation()) / time_inc_sec;
   lin_speed = velocity.x();
   lat_speed = velocity.y();
   ang_speed = std::remainder(rf2o::getYaw(robot_pose_.rotation()) -
