@@ -455,18 +455,21 @@ TEST(WarningCounts, SuppressedEventsAndInstances)
 {
   rf2o::CountedWarnings first, second;
   const auto logger = rclcpp::get_logger("warning_test");
-  first.warn(logger, "repeated failure %d", 1);
-  const auto next = first.events.at("repeated failure %d").next;
+  RF2O_WARN(first, logger, "repeated_failure", "repeated failure %d", 1);
+  const auto next = first.events.at("repeated_failure").next;
   for (int i = 0; i < 99; ++i)
-    first.warn(logger, "repeated failure %d", i);
-  EXPECT_EQ(first.events.at("repeated failure %d").count, 100u);
-  EXPECT_EQ(first.events.at("repeated failure %d").next, next);
-  second.warn(logger, "repeated failure %d", 2);
-  EXPECT_EQ(second.events.at("repeated failure %d").count, 1u);
-  first.events.at("repeated failure %d").next = std::chrono::steady_clock::time_point{};
-  first.warn(logger, "repeated failure %d", 3);
-  EXPECT_EQ(first.events.at("repeated failure %d").count, 101u);
-  EXPECT_GT(first.events.at("repeated failure %d").next, next);
+    RF2O_WARN(first, logger, "repeated_failure", "repeated failure %d", i);
+  EXPECT_EQ(first.events.at("repeated_failure").count, 100u);
+  EXPECT_EQ(first.events.at("repeated_failure").next, next);
+  RF2O_WARN(second, logger, "repeated_failure", "repeated failure %d", 2);
+  EXPECT_EQ(second.events.at("repeated_failure").count, 1u);
+  first.events.at("repeated_failure").next = std::chrono::steady_clock::time_point{};
+  RF2O_WARN(first, logger, "repeated_failure", "repeated failure %d", 3);
+  EXPECT_EQ(first.events.at("repeated_failure").count, 101u);
+  RF2O_WARN(first, logger, "repeated_failure", "changed wording %d", 4);
+  EXPECT_EQ(first.events.size(), 1u);
+  EXPECT_EQ(first.events.at("repeated_failure").count, 102u);
+  EXPECT_GT(first.events.at("repeated_failure").next, next);
 }
 
 TEST_F(Startup, SkippedScanWarningsKeepSuppressedCount)
@@ -478,5 +481,5 @@ TEST_F(Startup, SkippedScanWarningsKeepSuppressedCount)
     node->warnOnSkippedScan();
   }
   ASSERT_EQ(node->warnings.events.size(), 1u);
-  EXPECT_EQ(node->warnings.events.begin()->second.count, 100u);
+  EXPECT_EQ(node->warnings.events.at("scan_gap").count, 100u);
 }

@@ -64,4 +64,7 @@ warnings log their first occurrence immediately, then at most once per five
 seconds per warning kind and node instance. A steady clock keeps this working
 with paused simulation time. Each log includes its lifetime `total`; suppressed
 occurrences still increment the counter. The next published `<odom_topic>/quality`
-also carries `warning_total: ...` and `matcher_warning_total: ...` counters.
+also carries `warning_total: <id>` and `matcher_warning_total: <id>` counters.
+Stable node IDs are `scan_queue`, `tf_lookup`, `scan_gap`, `failed_match` and
+`missing_prior`; matcher IDs are `scan_geometry` and `eigensolver`. IDs remain
+independent of message wording and printf arguments.

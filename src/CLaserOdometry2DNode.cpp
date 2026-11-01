@@ -178,7 +178,7 @@ void CLaserOdometry2DNode::LaserCallBack(const sensor_msgs::msg::LaserScan::Shar
       (rclcpp::Time(pending_scans.back()->header.stamp) -
        rclcpp::Time(pending_scans.front()->header.stamp)).seconds() > 2.0)
   {
-    warnings.warn(get_logger(),
+    RF2O_WARN(warnings, get_logger(), "scan_queue",
         "Pending scan queue full; dropping oldest scan");
     pending_scans.pop_front();
   }
@@ -302,7 +302,7 @@ bool CLaserOdometry2DNode::setLaserPoseFromTf(bool allow_latest)
     }
     catch (tf2::TransformException &ex)
     {
-      warnings.warn(get_logger(),
+      RF2O_WARN(warnings, get_logger(), "tf_lookup",
           "Could not look up %s -> %s, keeping last known transform: %s",
           base_frame_id.c_str(), last_scan.header.frame_id.c_str(), ex.what());
       return false;
@@ -349,7 +349,7 @@ void CLaserOdometry2DNode::warnOnSkippedScan()
     const double period = last_scan.scan_time > 0.0f ? last_scan.scan_time : min_scan_gap;
     last_gap_periods = period > 0.0 ? gap / period : 0.0;
     if (period > 0.0 && gap > 1.5 * period)
-      warnings.warn(get_logger(), "Scan gap %.3fs is %.1f scan periods; a scan was skipped",
+      RF2O_WARN(warnings, get_logger(), "scan_gap", "Scan gap %.3fs is %.1f scan periods; a scan was skipped",
                   gap, gap / period);
   }
   last_scan_stamp = stamp;
@@ -417,7 +417,7 @@ void CLaserOdometry2DNode::process()
     rf2o_ref.kai_loc_old_ = previous_prior;
     rf2o_ref.cov_odo = previous_covariance;
     last_scan_stamp = rf2o_ref.last_odom_time;
-    warnings.warn(get_logger(),
+    RF2O_WARN(warnings, get_logger(), "failed_match",
       "Scan match failed (%s), not publishing", reason.c_str());
     publishQuality(tier, reason, q, sigma, increment);
     return;
@@ -598,7 +598,7 @@ bool CLaserOdometry2DNode::setOdomPrior()
   if (!have_matched_prior ||
       !odomPriorAt(rf2o_ref.current_scan_time.seconds(), p1))
   {
-    warnings.warn(get_logger(),
+    RF2O_WARN(warnings, get_logger(), "missing_prior",
       "No %s pose at both scan stamps (%.3f, %.3f; buffer %zu, %.3f..%.3f); "
       "using the constant-velocity prior", odom_prior_topic.c_str(),
       rf2o_ref.last_odom_time.seconds(), rf2o_ref.current_scan_time.seconds(),
