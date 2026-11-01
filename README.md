@@ -56,3 +56,12 @@ Initialization builds the first scan's pyramid. If a later match fails and
 wheel fallback cannot advance the pose, its candidate pyramid is discarded.
 The accepted pose, scan, head extrinsic, timestamp and cached odometry pose
 remain together; recovery spans the full interval from that reference.
+
+## Warning logs
+
+Repeated scan-gap, eigensolver, geometry, queue, TF, failed-match and missing-prior
+warnings log their first occurrence immediately, then at most once per five
+seconds per warning kind and node instance. A steady clock keeps this working
+with paused simulation time. Each log includes its lifetime `total`; suppressed
+occurrences still increment the counter. The next published `<odom_topic>/quality`
+also carries `warning_total: ...` and `matcher_warning_total: ...` counters.

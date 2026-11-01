@@ -24,6 +24,7 @@
 #include <numeric>
 // ROS headers
 #include <rclcpp/rclcpp.hpp>
+#include "rf2o_laser_odometry/counted_warning.hpp"
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/quaternion.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
@@ -101,6 +102,7 @@ struct ReferenceScan
 class CLaserOdometry2D: public rclcpp::Node
 {
 public:
+  CountedWarnings warnings;
 
   CLaserOdometry2D();
 
