@@ -1,3 +1,4 @@
+#include "rf2o_laser_odometry/counted_warning.hpp"
 #include "rf2o_laser_odometry/CLaserOdometry2D.hpp"
 
 #include <tf2/convert.hpp>
@@ -22,6 +23,7 @@ namespace rf2o {
 class CLaserOdometry2DNode : public rclcpp::Node
 {
 public:
+  CountedWarnings warnings;
   explicit CLaserOdometry2DNode(const rclcpp::NodeOptions &options = rclcpp::NodeOptions());
   enum class Tier { GOOD, DEGRADED, FAILED };
 

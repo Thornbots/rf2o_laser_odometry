@@ -237,7 +237,7 @@ bool CLaserOdometry2D::acceptsScanGeometry(const sensor_msgs::msg::LaserScan& sc
       scan.angle_increment == scan_angle_increment_ && scan.angle_max == scan_angle_max_)
     return true;
 
-  RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+  RF2O_WARN(warnings, get_logger(), "scan_geometry",
     "Skipping scan: geometry differs from initialized grid "
     "(size=%zu min=%.9g increment=%.9g max=%.9g; expected %u %.9g %.9g %.9g)",
     scan.ranges.size(), scan.angle_min, scan.angle_increment, scan.angle_max,
@@ -1079,7 +1079,7 @@ bool CLaserOdometry2D::filterLevelSolution()
       !eigensolver.eigenvalues().allFinite() || !eigensolver.eigenvectors().allFinite() ||
       (eigensolver.eigenvalues().array() < 0.f).any())
   {
-    RCLCPP_WARN(get_logger(), "WARNING: Eigensolver couldn't find a solution. Pose is not updated");
+    RF2O_WARN(warnings, get_logger(), "eigensolver", "WARNING: Eigensolver couldn't find a solution. Pose is not updated");
     return false;
   }
 
