@@ -23,5 +23,5 @@ and NaN weights. See `test/test_match_quality.cpp` and
 
 ## Open
 
-- Covariances are estimates; grade thresholds have drift-suite evidence.
-- `package.xml` is deprecated format 1; migration to format 3 is a separate change.
+Software commitments: [ROADMAP](../docs/ROADMAP.md#additional-mini-work).
+Physical validation: [ROBOT_TESTS](../docs/ROBOT_TESTS.md#parked-localization).
