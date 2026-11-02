@@ -31,6 +31,48 @@ The very low computational cost (0.9 milliseconds on a single CPU core) together
 
 For a full description of the algorithm, please refer to: **Planar Odometry from a Radial Laser Scanner. A Range Flow-based Approach. ICRA 2016** Available at: http://mapir.uma.es/papersrepo/2016/2016_Jaimez_ICRA_RF2O.pdf
 
+## Thornbots fork and usage
+
+This fork matches each scan at its timestamp using live lidar-to-base TF, so a
+moving head is supported. It publishes estimated covariances and match-quality
+diagnostics, supports a fixed-heading base and an odometry prior, and can retain
+parked reference scans. A failed match is not republished as a new measurement;
+confidence grading uses matcher evidence, not agreement with wheel odometry.
+See [localization tuning](../sentry_localization/README.md#configrf2oyaml).
+
+In the ROS container, from the workspace after sourcing ROS:
+
+```bash
+colcon build --packages-up-to rf2o_laser_odometry
+source install/setup.bash
+ros2 launch rf2o_laser_odometry rf2o_laser_odometry.launch.py
+```
+
+The standalone launch expects `/scan` and TF from `base_link` to the scan
+frame, publishes `/odom_rf2o` and `odom->base_link`, and starts at zero. Avoid
+running a second TF publisher for that edge. For the robot use
+[the localization launch](../sentry_localization/README.md#contract-with-thornbots_pkg),
+which configures frames, prior, and fusion; do not launch both instances.
+
+Parameters are declared in `src/CLaserOdometry2DNode.cpp`; their defaults are
+there, and the robot's overrides are in `sentry_localization/config/rf2o.yaml`.
+
+- `laser_scan_topic`, `odom_topic`, `base_frame_id`, `odom_frame_id`,
+  `publish_tf`, `init_pose_from_topic`: input, output, TF and initial pose.
+- `fixed_heading`, `odom_prior_topic`: constrain heading and provide the
+  scan-time motion prior and failed-match fallback.
+- `position_covariance`, `yaw_covariance`, `linear_velocity_covariance`,
+  `angular_velocity_covariance`: published variance floors.
+- `confidence_enabled`, `min_valid_fraction`, `fail_valid_fraction`,
+  `max_match_sigma`, `max_speed`, `max_extrinsic_age`: match grading and
+  extrinsic freshness thresholds. `degraded_position_variance`,
+  `failed_variance_rate`, `max_failed_variance`, and `recovery_matches`
+  control uncertainty during degradation and recovery. Diagnostics appear on
+  `<odom_topic>/quality`.
+- `reference_scans`, `reference_max_offset`, `reference_max_yaw`,
+  `reference_still_distance`, `reference_still_time`, `reference_max_scans`:
+  parked reference bank and its limits, described below.
+
 ## Scan-time startup
 
 When `init_pose_from_topic` and `odom_prior_topic` name the same nonempty
@@ -56,3 +98,15 @@ Initialization builds the first scan's pyramid. If a later match fails and
 wheel fallback cannot advance the pose, its candidate pyramid is discarded.
 The accepted pose, scan, head extrinsic, timestamp and cached odometry pose
 remain together; recovery spans the full interval from that reference.
+
+## Warning logs
+
+Repeated scan-gap, eigensolver, geometry, queue, TF, failed-match and missing-prior
+warnings log their first occurrence immediately, then at most once per five
+seconds per warning kind and node instance. A steady clock keeps this working
+with paused simulation time. Each log includes its lifetime `total`; suppressed
+occurrences still increment the counter. The next published `<odom_topic>/quality`
+also carries `warning_total: <id>` and `matcher_warning_total: <id>` counters.
+Stable node IDs are `scan_queue`, `tf_lookup`, `scan_gap`, `failed_match` and
+`missing_prior`; matcher IDs are `scan_geometry` and `eigensolver`. IDs remain
+independent of message wording and printf arguments.
