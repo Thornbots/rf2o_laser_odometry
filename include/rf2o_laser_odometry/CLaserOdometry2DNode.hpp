@@ -59,6 +59,7 @@ public:
   double              max_match_sigma;        // m, per axis; above: degraded
   double              max_speed;              // m/s; above: failed
   double              max_extrinsic_age;      // s the latest extrinsic may trail the scan
+  double              extrinsic_lookahead_s = 0.0;  // sim: wait for TF this far past the scan stamp
   double              degraded_position_variance;  // m^2, added per weak axis
   double              failed_variance_rate;   // m^2/s while failed
   double              max_failed_variance;    // m^2 cap

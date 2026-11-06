@@ -213,6 +213,28 @@ TEST_F(Startup, WaitsForFutureOdomAndTfThenSeedsAtScanStamp)
   EXPECT_TRUE(node->pending_scans.empty());
 }
 
+TEST_F(Startup, ExtrinsicLookaheadWaitsForANewerTfSample)
+{
+  node->extrinsic_lookahead_s = 0.001;
+  odom(1.0, 0.0);
+  odom(2.0, 1.0);
+  tfAt(1.5);
+  scan(1.5);
+  EXPECT_FALSE(node->rf2o_ref.is_initialized());
+  tfAt(1.51);
+  node->drainPendingScans();
+  EXPECT_TRUE(node->rf2o_ref.is_initialized());
+}
+
+TEST_F(Startup, NoLookaheadUsesTfAtTheStamp)
+{
+  odom(1.0, 0.0);
+  odom(2.0, 1.0);
+  tfAt(1.5);
+  scan(1.5);
+  EXPECT_TRUE(node->rf2o_ref.is_initialized());
+}
+
 TEST_F(Startup, NeverHoldsOdomEndpoint)
 {
   odom(1.0, 0.0);
