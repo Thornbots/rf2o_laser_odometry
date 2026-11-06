@@ -99,6 +99,16 @@ wheel fallback cannot advance the pose, its candidate pyramid is discarded.
 The accepted pose, scan, head extrinsic, timestamp and cached odometry pose
 remain together; recovery spans the full interval from that reference.
 
+## Extrinsic lookahead
+
+`extrinsic_lookahead_s` (default 0, simulation only) makes a scan also wait
+for TF this far past its stamp. A scan stamped exactly on a TF sample gets
+that sample if no newer one has arrived, but tf2's interpolation at ratio 0
+(1 ulp off in the quaternion product) if one has, so the laser extrinsic, and
+every pose after it, depended on message timing at about 1e-13. Waiting for a
+newer sample makes the second case the only one. The lockstep simulation sets
+0.001 s, which needs at most the next head sample.
+
 ## Warning logs
 
 Repeated scan-gap, eigensolver, geometry, queue, TF, failed-match and missing-prior

@@ -77,6 +77,12 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(const rclcpp::NodeOptions &options)
   this->get_parameter("max_speed", max_speed);
   this->declare_parameter<double>("max_extrinsic_age", 0.1);
   this->get_parameter("max_extrinsic_age", max_extrinsic_age);
+  // Simulation only (0 = off). A scan stamped exactly on a TF sample is
+  // looked up exactly if no newer sample has arrived, but slerped at ratio 0
+  // (1 ulp off) if one has, so the extrinsic depended on message timing.
+  // Waiting for TF this far past the stamp makes both cases the second.
+  this->declare_parameter<double>("extrinsic_lookahead_s", 0.0);
+  this->get_parameter("extrinsic_lookahead_s", extrinsic_lookahead_s);
   this->declare_parameter<double>("degraded_position_variance", 0.1 * 0.1);
   this->get_parameter("degraded_position_variance", degraded_position_variance);
   this->declare_parameter<double>("failed_variance_rate", 0.05);
@@ -219,7 +225,9 @@ void CLaserOdometry2DNode::drainPendingScans()
     }
     // No timeout here: callbacks must run to supply the missing transform.
     if (!overdue && !buffer_->canTransform(base_frame_id, scan->header.frame_id,
-                                           tf2_ros::fromMsg(scan->header.stamp)))
+                                           tf2_ros::fromMsg(scan->header.stamp) +
+                                           std::chrono::nanoseconds(static_cast<int64_t>(
+                                               extrinsic_lookahead_s * 1e9))))
       return;
     last_scan = *scan;
     if (!setLaserPoseFromTf(overdue) && !overdue)
