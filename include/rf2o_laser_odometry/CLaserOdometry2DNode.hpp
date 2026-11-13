@@ -1,3 +1,4 @@
+#include "rf2o_laser_odometry/counted_warning.hpp"
 #include "rf2o_laser_odometry/CLaserOdometry2D.hpp"
 
 #include <tf2/convert.hpp>
@@ -14,6 +15,7 @@
 #include <cstring>
 #include <deque>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 namespace rf2o {
@@ -21,12 +23,13 @@ namespace rf2o {
 class CLaserOdometry2DNode : public rclcpp::Node
 {
 public:
-  CLaserOdometry2DNode();
+  CountedWarnings warnings;
+  explicit CLaserOdometry2DNode(const rclcpp::NodeOptions &options = rclcpp::NodeOptions());
   enum class Tier { GOOD, DEGRADED, FAILED };
 
   void process();
   void publish(const Eigen::Matrix2d &position_cov);
-  bool setLaserPoseFromTf();
+  bool setLaserPoseFromTf(bool allow_latest = false);
   void warnOnSkippedScan();
 
   // Params & vars
@@ -56,11 +59,13 @@ public:
   double              max_match_sigma;        // m, per axis; above: degraded
   double              max_speed;              // m/s; above: failed
   double              max_extrinsic_age;      // s the latest extrinsic may trail the scan
+  double              extrinsic_lookahead_s = 0.0;  // sim: wait for TF this far past the scan stamp
   double              degraded_position_variance;  // m^2, added per weak axis
   double              failed_variance_rate;   // m^2/s while failed
   double              max_failed_variance;    // m^2 cap
   int                 recovery_matches;       // good matches to shed it
   double              failed_extra = 0.0;     // current added variance, m^2
+  rclcpp::Time        last_failed_scan_stamp{0, 0, RCL_ROS_TIME};
   double              recovery_step = 0.0;
   bool                extrinsic_stale = false;
   double              extrinsic_age = 0.0;    // s behind the scan; -1 if lookups failed
@@ -85,6 +90,34 @@ public:
   std::deque<OdomSample>                                        odom_prior_buf;
   bool odomPriorAt(double t, OdomSample &out) const;
   bool setOdomPrior();
+  void drainPendingScans();
+  void resetClockHistory(double stamp);
+  bool retiredClockStamp(double stamp);
+  bool pose_initialized_once = false;
+  double reset_stamp = -1.0;
+  double retired_epoch_end = -1.0;
+  rclcpp::Time reset_clock_time{0, 0, RCL_ROS_TIME};
+  std::deque<sensor_msgs::msg::LaserScan::SharedPtr> pending_scans;
+  rclcpp::TimerBase::SharedPtr pending_timer;
+  int64_t newest_scan_stamp = -1;
+  OdomSample matched_prior{};
+  bool have_matched_prior = false;
+
+  // Reference scans; see README.md. Each keeps the odom prior and robot
+  // position at its stamp, to seed matches and drop it once the robot moves.
+  struct Reference { ReferenceScan scan; OdomSample odom; Eigen::Vector2d robot_xy; };
+  bool                reference_scans;
+  double              reference_max_offset;   // m rf2o may move from one
+  double              reference_still_distance;  // m odom may wander while parked
+  double              reference_still_time;   // s odom must stay put first
+  double              reference_max_age;      // s before refreshing the parked anchor
+  OdomSample          still_odom{0, 0, 0, 0};
+  double              still_since = -1.0;     // s; -1 without odom
+  std::vector<Reference>                                        references;
+  bool parked();
+  const Reference *findReference() const;
+  bool seedFromReference(const Reference &ref);
+  void updateReferences(Tier tier, const Reference *used);
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr         odom_pub;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr quality_pub;
 
@@ -99,3 +132,4 @@ public:
   void odomPriorCallBack(const nav_msgs::msg::Odometry::SharedPtr msg);
 };
 
+}  // namespace rf2o
