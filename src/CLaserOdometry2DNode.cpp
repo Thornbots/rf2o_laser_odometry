@@ -91,8 +91,8 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(const rclcpp::NodeOptions &options)
   this->get_parameter("max_failed_variance", max_failed_variance);
   this->declare_parameter<int>("recovery_matches", 20);
   this->get_parameter("recovery_matches", recovery_matches);
-  // Match a parked robot's scans against earlier scans from the same head
-  // angle, so scan-match noise stops integrating while it stays put. Parked:
+  // Match a parked robot's scans against one anchor scan per park, so
+  // scan-match noise stops integrating while it stays put. Parked:
   // odom within reference_still_distance for reference_still_time.
   this->declare_parameter<bool>("reference_scans", false);
   this->get_parameter("reference_scans", reference_scans);
