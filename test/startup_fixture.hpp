@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 #include <rcl/time.h>
+#include <cmath>
 #include <limits>
 #include <fstream>
 #include "rf2o_laser_odometry/CLaserOdometry2DNode.hpp"
@@ -12,6 +13,12 @@ constexpr float kAngleMin = -M_PI;
 constexpr float kAngleIncrement = 2 * M_PI / 720;
 constexpr float kAngleSpan = 719 * kAngleIncrement;
 constexpr float kAngleMax = kAngleMin + kAngleSpan;
+// Nearest nanosecond: truncating t*1e9 is off by 1 ns whenever t is a hair
+// under its decimal value, which depends on FMA contraction (aarch64 vs x86-64).
+inline rclcpp::Time stampAt(double seconds)
+{
+  return rclcpp::Time(std::llround(seconds * 1e9));
+}
 class Startup : public ::testing::Test
 {
 protected:
@@ -36,7 +43,7 @@ protected:
   void tfAt(double time, double yaw = 0.0)
   {
     geometry_msgs::msg::TransformStamped t;
-    t.header.stamp = rclcpp::Time(static_cast<int64_t>(time * 1e9));
+    t.header.stamp = stampAt(time);
     t.header.frame_id = "base_link";
     t.child_frame_id = "laser";
     tf2::Quaternion q;
@@ -49,7 +56,7 @@ protected:
   void odom(double time, double x)
   {
     auto msg = std::make_shared<nav_msgs::msg::Odometry>();
-    msg->header.stamp = rclcpp::Time(static_cast<int64_t>(time * 1e9));
+    msg->header.stamp = stampAt(time);
     msg->pose.pose.position.x = x;
     msg->pose.pose.orientation.w = 1.0;
     node->initPoseCallBack(msg);
@@ -58,7 +65,7 @@ protected:
   void scan(double time)
   {
     auto msg = std::make_shared<sensor_msgs::msg::LaserScan>();
-    msg->header.stamp = rclcpp::Time(static_cast<int64_t>(time * 1e9));
+    msg->header.stamp = stampAt(time);
     msg->header.frame_id = "laser";
     msg->angle_min = -M_PI;
     msg->angle_increment = 2 * M_PI / 720;
@@ -81,7 +88,7 @@ protected:
     if (prior) odom(t, wheel);
     tfAt(t, head);
     auto msg = std::make_shared<sensor_msgs::msg::LaserScan>();
-    msg->header.stamp = rclcpp::Time(static_cast<int64_t>(t * 1e9));
+    msg->header.stamp = stampAt(t);
     msg->header.frame_id = "laser";
     msg->angle_min = -M_PI;
     // A2M8 angle compensation includes both -pi and +pi endpoints.

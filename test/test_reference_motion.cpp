@@ -124,6 +124,10 @@ TEST_F(Startup, FullHeadSweepHasNoAnchorSwitchSteps)
 TEST_F(Startup, ReferencesOffMatchesUnanchoredStream)
 {
   // Recorded by #16 (ee3ff63) with the identical scene stream; see README.
+  // The recording matches an FMA-contracting build (aarch64 GCC) to 1e-7 m, but
+  // x86-64 rounds each float solve differently and 200 scans random-walk to
+  // 3.5 um. 10 um is still far below the 3 mm/scan motion of the stream.
+  constexpr double kPositionTolerance = 1e-5;
   std::ifstream baseline(std::string(RF2O_TEST_DATA) + "/ee3ff63_poses.txt");
   ASSERT_TRUE(baseline.good());
   std::vector<Eigen::Vector3d> poses;
@@ -146,8 +150,8 @@ TEST_F(Startup, ReferencesOffMatchesUnanchoredStream)
         ASSERT_TRUE(baseline >> x >> comma1 >> y >> comma2 >> yaw);
         ASSERT_EQ(comma1, ',');
         ASSERT_EQ(comma2, ',');
-        EXPECT_NEAR(pose.x(), x, 1e-7) << i;
-        EXPECT_NEAR(pose.y(), y, 1e-7) << i;
+        EXPECT_NEAR(pose.x(), x, kPositionTolerance) << i;
+        EXPECT_NEAR(pose.y(), y, kPositionTolerance) << i;
         EXPECT_NEAR(rf2o::getYaw(node->rf2o_ref.robot_pose_.rotation()), yaw, 1e-7) << i;
       }
       else EXPECT_TRUE(pose.isApprox(poses[i], 1e-12)) << i;
