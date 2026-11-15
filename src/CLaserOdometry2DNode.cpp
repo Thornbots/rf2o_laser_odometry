@@ -118,7 +118,14 @@ CLaserOdometry2DNode::CLaserOdometry2DNode(const rclcpp::NodeOptions &options)
   // Init Publishers and Subscribers
   //---------------------------------
   buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+#ifdef RF2O_NODE_TEST
+  // Tests feed buffer_ directly. The default listener thread can lose the
+  // executor cancel() sent by a node destroyed before it starts spinning, so
+  // ~TransformListener() joins forever (seen under CPU load in CI).
+  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*buffer_, this, false);
+#else
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*buffer_);
+#endif
   odom_broadcaster = std::make_unique<tf2_ros::TransformBroadcaster>(this);
   odom_pub  = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic, 5);
   quality_pub = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(odom_topic + "/quality", 10);

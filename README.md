@@ -144,7 +144,9 @@ moving head against `test/ee3ff63_poses.txt`, recorded using the startup-only
 implementation at commit `ee3ff6393b626bbcbe17fd821aa1d14f6b489726` (#16).
 The same stream with references enabled but never parked must match it too.
 The fixture records x, y and yaw; the test constructs the scan stream and
-requires every accepted pose to agree within 0.1 micrometre/radian.
+requires every accepted pose to agree within 10 micrometres and 0.1 microradian.
+FMA-contracting builds (aarch64) reproduce the recording to 0.1 micrometre;
+x86-64 builds drift from it by a few micrometres over the stream.
 
 The registered unit tests run with `colcon test --packages-select
 rf2o_laser_odometry`, without GTest sharding. Startup, reference motion,
