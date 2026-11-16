@@ -80,9 +80,9 @@ there, and the robot's overrides are in `sentry_localization/config/rf2o.yaml`.
   `failed_variance_rate`, `max_failed_variance`, and `recovery_matches`
   control uncertainty during degradation and recovery. Diagnostics appear on
   `<odom_topic>/quality`.
-- `reference_scans`, `reference_max_offset`, `reference_max_yaw`,
-  `reference_still_distance`, `reference_still_time`, `reference_max_scans`:
-  parked reference bank and its limits, described below.
+- `reference_scans`, `reference_max_offset`, `reference_still_distance`,
+  `reference_still_time`, `reference_max_age` (7.5 s): parked reference anchor
+  and its limits, described below.
 
 ## Scan-time startup
 
